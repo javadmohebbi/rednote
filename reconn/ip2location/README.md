@@ -81,6 +81,7 @@ Download:
 Output:
   --list              Show all databases with download status
   --json              JSON output (single IP → object, multiple → array)
+  --csv               CSV output with a header row
 ```
 
 ### Examples
@@ -175,6 +176,32 @@ CIDR ranges for country: JP  (showing 5 of 8241)
   1.21.0.0/17
   1.66.0.0/15
   1.72.0.0/13
+```
+
+### CSV output
+
+`--csv` works for both forward and reverse lookups. The header row is derived from
+whichever fields the queried database(s) populate, in a consistent column order.
+
+```bash
+# Single or multiple IPs
+python ip2location.py --csv 8.8.8.8
+python ip2location.py --csv 8.8.8.8 1.1.1.1 9.9.9.9
+
+# Pipe to a file
+python ip2location.py --csv --db DB11 8.8.8.8 1.1.1.1 > results.csv
+
+# Reverse lookup as CSV
+python ip2location.py --reverse-country DE --limit 100 --csv > de_ranges.csv
+python ip2location.py --reverse-city Tokyo --csv
+```
+
+Example output:
+
+```
+ip,hostname,country_code,country_name,region,city,latitude,longitude,zip,timezone,isp,domain,usage_type,asn,as_name,cidr,is_proxy,proxy_type
+8.8.8.8,dns.google,US,United States of America,California,Mountain View,37.38600,-122.08380,94043,-07:00,Google LLC,google.com,DCH,AS15169,Google LLC,8.8.8.0/24,No,-
+1.1.1.1,one.one.one.one,AU,Australia,Queensland,Research,-27.46794,153.02809,4000,+10:00,Cloudflare Inc.,cloudflare.com,CDN,AS13335,Cloudflare Inc.,1.1.1.0/24,No,-
 ```
 
 ---

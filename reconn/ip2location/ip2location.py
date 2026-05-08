@@ -788,6 +788,37 @@ def print_reverse(rows: list, label: str, total_hint: str = ""):
     print()
 
 
+def print_csv(rows: list):
+    """Write rows as RFC-4180 CSV to stdout, deriving the header from all keys present."""
+    if not rows:
+        return
+
+    # Collect every key that appears across all rows, in a stable display order.
+    # _prefixed keys are internal and excluded.
+    known_order = [
+        "ip", "hostname",
+        "country_code", "country_name", "region", "city",
+        "latitude", "longitude", "zip", "timezone",
+        "isp", "domain", "usage_type",
+        "asn", "as_name", "cidr",
+        "is_proxy", "proxy_type", "threat", "provider", "fraud_score", "last_seen",
+    ]
+    all_keys = {k for r in rows for k in r if not k.startswith("_")}
+    # Preserve known order first, then any extra keys alphabetically.
+    fieldnames = [k for k in known_order if k in all_keys] + \
+                 sorted(all_keys - set(known_order))
+
+    writer = csv.DictWriter(
+        sys.stdout,
+        fieldnames=fieldnames,
+        extrasaction="ignore",   # silently drop _sources, _error etc.
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 10 — CLI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -868,10 +899,11 @@ def main():
             city=args.reverse_city,
             limit=args.limit,
         )
+        cleaned = [{k: v.strip('"') for k, v in r.items()} for r in rows]
         if args.json:
-            # Strip internal quote characters that CSV might leave around values.
-            cleaned = [{k: v.strip('"') for k, v in r.items()} for r in rows]
             print(json.dumps(cleaned, indent=2))
+        elif args.csv:
+            print_csv(cleaned)
         else:
             label = args.reverse_country or f'"{args.reverse_city}"'
             print_reverse(rows, label)
@@ -895,13 +927,15 @@ def main():
     db_name = args.db.upper() if args.db else None
     all_results = [lookup(ip.strip(), db_name) for ip in args.ips]
 
+    def _pub(d):
+        return {k: v for k, v in d.items() if not k.startswith("_")}
+
     if args.json:
-        # Strip internal _keys (like _sources, _error) before serialising.
-        def _pub(d):
-            return {k: v for k, v in d.items() if not k.startswith("_")}
         out = _pub(all_results[0]) if len(all_results) == 1 \
               else [_pub(r) for r in all_results]
         print(json.dumps(out, indent=2))
+    elif args.csv:
+        print_csv([_pub(r) for r in all_results])
     elif len(all_results) == 1:
         print_result(all_results[0])
     else:
