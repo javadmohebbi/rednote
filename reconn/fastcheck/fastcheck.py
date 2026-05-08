@@ -26,10 +26,11 @@ import json
 import shutil
 import argparse
 import ipaddress
+import itertools
 import subprocess
 import threading
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -59,19 +60,28 @@ def expand_target(raw: str) -> list:
       10.0.0.1            single IPv4
       2001:db8::1         single IPv6
       10.0.0.0/24         CIDR  → every host address in the block
-      10.0.0.1-10.0.0.50  full IPv4 range
+      10.0.0.1-10.0.0.50  full IPv4 range (spaces around dash are fine)
       10.0.0.1-50         shorthand range (last-octet end)
       example.com         hostname (returned as-is)
+
+    Yields one host string at a time — no list is built in memory.
     """
     raw = raw.strip()
     if not raw:
-        return []
+        return
 
     # ── CIDR ─────────────────────────────────────────────────────────────────
     try:
-        net   = ipaddress.ip_network(raw, strict=False)
-        hosts = list(net.hosts())
-        return [str(h) for h in hosts] if hosts else [str(net.network_address)]
+        net = ipaddress.ip_network(raw, strict=False)
+        # net.hosts() is a lazy iterator — safe for /8 (16 M addresses)
+        hosts = net.hosts()
+        yielded = False
+        for h in hosts:
+            yield str(h)
+            yielded = True
+        if not yielded:                         # /32 or /128
+            yield str(net.network_address)
+        return
     except ValueError:
         pass
 
@@ -86,25 +96,21 @@ def expand_target(raw: str) -> list:
             except ipaddress.AddressValueError:
                 prefix = ".".join(str(start).split(".")[:3])
                 end    = ipaddress.IPv4Address(f"{prefix}.{end_s}")
-            return [str(ipaddress.IPv4Address(i))
-                    for i in range(int(start), int(end) + 1)]
+            for i in range(int(start), int(end) + 1):
+                yield str(ipaddress.IPv4Address(i))
+            return
         except (ValueError, ipaddress.AddressValueError):
             pass
 
     # ── Single IP or hostname ─────────────────────────────────────────────────
-    return [raw]
+    yield raw
 
 
-def load_targets(args) -> list:
-    """
-    Build the complete ordered list of scan entries from CLI arguments.
-    Each entry: {"target": "10.0.0.1", "input": "10.0.0.0/24"}
-    """
-    raw_list = []
-
+def _raw_list(args) -> list:
+    """Return the list of raw (unexpanded) target strings from CLI args."""
+    raw = []
     if args.target:
-        raw_list.append(args.target)
-
+        raw.append(args.target)
     if args.file:
         path = Path(args.file)
         if not path.exists():
@@ -113,16 +119,53 @@ def load_targets(args) -> list:
             for line in fh:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    raw_list.append(line)
-
-    if not raw_list:
+                    raw.append(line)
+    if not raw:
         sys.exit("[ERROR] No targets — provide TARGET or use -f FILE.")
+    return raw
 
-    entries = []
+
+def count_targets(raw_list: list) -> int:
+    """
+    Count the total number of hosts without expanding them into memory.
+    Uses integer arithmetic for CIDRs and ranges — O(1) per spec regardless
+    of how large the block is.
+    """
+    total = 0
+    for raw in raw_list:
+        raw = raw.strip()
+        # CIDR
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+            n   = int(net.num_addresses)
+            total += max(n - 2, 1) if net.prefixlen < 31 else n
+            continue
+        except ValueError:
+            pass
+        # Range
+        if "-" in raw:
+            parts = raw.split("-", 1)
+            try:
+                start = ipaddress.IPv4Address(parts[0].strip())
+                end_s = parts[1].strip()
+                try:
+                    end = ipaddress.IPv4Address(end_s)
+                except ipaddress.AddressValueError:
+                    prefix = ".".join(str(start).split(".")[:3])
+                    end    = ipaddress.IPv4Address(f"{prefix}.{end_s}")
+                total += int(end) - int(start) + 1
+                continue
+            except (ValueError, ipaddress.AddressValueError):
+                pass
+        total += 1
+    return total
+
+
+def iter_targets(raw_list: list):
+    """Yield {"target": ip, "input": original_spec} entries lazily, one at a time."""
     for raw in raw_list:
         for host in expand_target(raw):
-            entries.append({"target": host, "input": raw})
-    return entries
+            yield {"target": host, "input": raw}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -559,9 +602,10 @@ def main():
 
     NMAP_VERSION = check_nmap()
     preflight_check(args.light)
-    targets      = load_targets(args)
-    total        = len(targets)
-    multi        = total > 1
+
+    raw_list = _raw_list(args)
+    total    = count_targets(raw_list)   # O(1) per spec — never touches individual IPs
+    multi    = total > 1
 
     # Timeout: default scan uses more probes and needs more time.
     if args.timeout is not None:
@@ -590,11 +634,29 @@ def main():
         if fh and (not args.up_only or result.get("status") == "up"):
             write_record(fh, result)
 
+    # Bounded sliding-window execution:
+    # At most (workers × 4) futures live in memory at any time.
+    # The generator feeds new work only as old futures complete, so memory
+    # stays flat even for 10 M+ targets.
+    MAX_PENDING = args.workers * 4
+
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(run_one, e) for e in targets]
-            for future in as_completed(futures):
-                future.result()
+            gen     = iter_targets(raw_list)
+            pending = set()
+
+            # Prime the window
+            for entry in itertools.islice(gen, MAX_PENDING):
+                pending.add(pool.submit(run_one, entry))
+
+            # Slide: as futures finish, retire them and submit new ones
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for f in done:
+                    f.result()                              # surface exceptions
+                for entry in itertools.islice(gen, len(done)):
+                    pending.add(pool.submit(run_one, entry))
+
     except KeyboardInterrupt:
         pass
     finally:
