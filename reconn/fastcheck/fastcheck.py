@@ -23,6 +23,7 @@ Prerequisites
 
 import sys
 import json
+import shutil
 import argparse
 import ipaddress
 import subprocess
@@ -33,7 +34,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
+# ── ANSI codes ────────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
@@ -70,7 +71,6 @@ def expand_target(raw: str) -> list:
     try:
         net   = ipaddress.ip_network(raw, strict=False)
         hosts = list(net.hosts())
-        # /32 or /128 have no hosts(); return the address itself
         return [str(h) for h in hosts] if hosts else [str(net.network_address)]
     except ValueError:
         pass
@@ -84,13 +84,12 @@ def expand_target(raw: str) -> list:
             try:
                 end = ipaddress.IPv4Address(end_s)
             except ipaddress.AddressValueError:
-                # Shorthand: "10.0.0.1-50" → end = "10.0.0.50"
                 prefix = ".".join(str(start).split(".")[:3])
-                end = ipaddress.IPv4Address(f"{prefix}.{end_s}")
+                end    = ipaddress.IPv4Address(f"{prefix}.{end_s}")
             return [str(ipaddress.IPv4Address(i))
                     for i in range(int(start), int(end) + 1)]
         except (ValueError, ipaddress.AddressValueError):
-            pass  # not a range — fall through to single host
+            pass
 
     # ── Single IP or hostname ─────────────────────────────────────────────────
     return [raw]
@@ -99,9 +98,7 @@ def expand_target(raw: str) -> list:
 def load_targets(args) -> list:
     """
     Build the complete ordered list of scan entries from CLI arguments.
-
     Each entry: {"target": "10.0.0.1", "input": "10.0.0.0/24"}
-    'input' preserves the original spec the user provided.
     """
     raw_list = []
 
@@ -135,14 +132,12 @@ def load_targets(args) -> list:
 def check_nmap() -> str:
     """Return the nmap version string, or exit with a helpful error."""
     try:
-        out = subprocess.run(
+        out   = subprocess.run(
             ["nmap", "--version"], capture_output=True, timeout=5
         ).stdout.decode(errors="replace")
         first = out.splitlines()[0] if out else ""
-        # "Nmap version 7.99 ( https://nmap.org )" → "7.99"
-        tokens = first.split()
-        for tok in tokens:
-            if tok[0].isdigit():
+        for tok in first.split():
+            if tok and tok[0].isdigit():
                 return tok
         return "unknown"
     except FileNotFoundError:
@@ -159,15 +154,13 @@ def scan_host(target: str, timeout: int) -> dict:
     Run  nmap -sn -T4  against a single target and return a result dict.
 
     -sn           ping scan only (ICMP echo + ARP) — no port scanning
-    -T4           aggressive timing template for faster responses
+    -T4           aggressive timing for faster responses
     --host-timeout cap per-host wait time
-    -oX -         structured XML output to stdout for reliable parsing
+    -oX -         XML output to stdout for reliable parsing
     """
-    ts = datetime.now(tz=timezone.utc).isoformat()
-
     result = {
-        "timestamp":    ts,
-        "input":        target,   # overwritten by caller with the original spec
+        "timestamp":    datetime.now(tz=timezone.utc).isoformat(),
+        "input":        target,
         "target":       target,
         "status":       "unknown",
         "latency_ms":   None,
@@ -175,23 +168,18 @@ def scan_host(target: str, timeout: int) -> dict:
         "mac":          None,
         "nmap_version": NMAP_VERSION,
     }
-
-    cmd = [
-        "nmap", "-sn", "-T4",
-        "--host-timeout", f"{timeout}s",
-        "-oX", "-",
-        target,
-    ]
-
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+        proc = subprocess.run(
+            ["nmap", "-sn", "-T4", "--host-timeout", f"{timeout}s", "-oX", "-", target],
+            capture_output=True,
+            timeout=timeout + 10,
+        )
         _parse_nmap_xml(proc.stdout.decode(errors="replace"), result)
     except subprocess.TimeoutExpired:
         result["status"] = "timeout"
     except Exception as exc:
         result["status"] = "error"
         result["error"]  = str(exc)
-
     return result
 
 
@@ -206,16 +194,13 @@ def _parse_nmap_xml(xml: str, result: dict):
 
     host_el = root.find("host")
     if host_el is None:
-        # nmap produced no <host> element → target did not respond
         result["status"] = "down"
         return
 
-    # up / down
     st = host_el.find("status")
     if st is not None:
         result["status"] = st.get("state", "unknown")
 
-    # Resolved IP address and optional MAC
     for addr in host_el.findall("address"):
         atype = addr.get("addrtype", "")
         if atype in ("ipv4", "ipv6"):
@@ -223,13 +208,11 @@ def _parse_nmap_xml(xml: str, result: dict):
         elif atype == "mac":
             result["mac"] = addr.get("addr")
 
-    # Reverse-DNS hostname (PTR record)
     for hn in host_el.findall(".//hostname"):
         if hn.get("type") == "PTR":
             result["hostname"] = hn.get("name")
             break
 
-    # Round-trip latency: <times srtt="N"> in microseconds → convert to ms
     times = host_el.find("times")
     if times is not None:
         srtt = times.get("srtt", "")
@@ -238,40 +221,192 @@ def _parse_nmap_xml(xml: str, result: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3 — Live progress display
+# 3 — Live display
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Layout (all row numbers are 1-indexed):
+#
+#   Row 1         ─── separator bar ─────────────────────────────────────────
+#   Row 2         fastcheck · nmap X.XX
+#   Row 3         Targets: N  Workers: W  Timeout: Ts  → output.jsonl
+#   Row 4         ─── separator bar ─────────────────────────────────────────
+#   Rows 5..vend  SCROLL REGION — IP results appear here and scroll upward
+#   Row vend+1    ─── separator bar ─────────────────────────────────────────
+#   Row vend+2    Up: N  Down: N  [████░░░░] X/N
+#
+# The scroll region is set with ANSI  \033[5;{vend}r.
+# When a new result arrives, we move to the last row of the region, emit \n
+# (which scrolls the region up one line), then write the new line in the
+# now-blank bottom row.  The header and footer are outside the region and
+# are never disturbed by scroll operations.
 
-_print_lock = threading.Lock()
+class LiveDisplay:
+    HEADER = 4   # fixed rows at top (rows 1–4)
+    FOOTER = 3   # fixed rows at bottom (sep + stats + blank)
+
+    def __init__(self, total: int, workers: int, timeout: int,
+                 out_path, nmap_ver: str):
+        cols, rows = shutil.get_terminal_size((80, 24))
+        self.total   = total
+        self.cols    = cols
+        self.rows    = rows
+        self.v_start = self.HEADER + 1                      # first row of scroll region
+        self.v_end   = max(self.v_start + 2, rows - self.FOOTER)  # last row
+        self.f_sep   = self.v_end + 1                       # footer separator row
+        self.f_stats = self.v_end + 2                       # stats row
+        self.lock    = threading.Lock()
+        self.done    = 0
+        self.counts  = {"up": 0, "down": 0, "other": 0}
+
+        o  = sys.stdout
+        bar = "─" * cols
+
+        o.write("\033[2J\033[H")    # clear screen, cursor home
+        o.write("\033[?25l")        # hide cursor
+        o.write("\033[?7l")         # disable line-wrap (lines are clipped, not wrapped)
+
+        # ── Fixed header ──────────────────────────────────────────────────────
+        self._at(1); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
+        self._at(2); o.write(f"{BOLD}  fastcheck  ·  nmap {nmap_ver}{RESET}")
+        self._at(3)
+        info = f"  Targets: {total}  Workers: {workers}  Timeout: {timeout}s"
+        if out_path:
+            info += f"  →  {out_path}"
+        o.write(info)
+        self._at(4); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
+
+        # ── Fixed footer ──────────────────────────────────────────────────────
+        self._at(self.f_sep);   o.write(f"{DIM}{bar}{RESET}")
+        self._draw_stats()
+
+        # ── Activate scroll region ────────────────────────────────────────────
+        o.write(f"\033[{self.v_start};{self.v_end}r")
+        self._at(self.v_end)    # park cursor at bottom of viewport
+        o.flush()
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _at(self, row: int, col: int = 1):
+        sys.stdout.write(f"\033[{row};{col}H")
+
+    def _draw_stats(self):
+        """Redraw the progress/stats line (call with lock held, or during init)."""
+        o    = sys.stdout
+        up   = self.counts["up"]
+        down = self.counts["down"]
+        done = self.done
+        pct  = done / self.total if self.total else 0
+        bw   = max(10, min(30, self.cols - 52))
+        fill = int(bw * pct)
+        bar  = f"{'█' * fill}{'░' * (bw - fill)}"
+
+        self._at(self.f_stats)
+        o.write("\033[K")
+        o.write(
+            f"  {GREEN}Up: {up:<5}{RESET}"
+            f"  {RED}Down: {down:<5}{RESET}"
+            f"  {CYAN}[{bar}]{RESET}"
+            f"  {done}/{self.total}"
+        )
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def add_result(self, result: dict):
+        """Append one result line to the scrolling viewport (thread-safe)."""
+        status = result.get("status", "?")
+        target = result.get("target", "?")
+        lat    = result.get("latency_ms")
+        host   = result.get("hostname") or ""
+        w      = len(str(self.total))
+
+        lat_s = f"{lat:.2f}ms" if lat is not None else ""
+
+        if status == "up":
+            st_s  = f"{GREEN}{BOLD}up  {RESET}"
+            lat_s = f"{DIM}{lat_s:<10}{RESET}"
+        elif status == "down":
+            st_s  = f"{RED}down{RESET}"
+            lat_s = " " * 10
+        elif status == "timeout":
+            st_s  = f"{YELLOW}tout{RESET}"
+            lat_s = " " * 10
+        else:
+            st_s  = f"{YELLOW}{status[:4]:<4}{RESET}"
+            lat_s = " " * 10
+
+        host_s = f"  {DIM}{host}{RESET}" if host else ""
+
+        with self.lock:
+            self.done += 1
+            s = result.get("status", "other")
+            if   s == "up":   self.counts["up"]    += 1
+            elif s == "down": self.counts["down"]  += 1
+            else:             self.counts["other"] += 1
+
+            counter = f"{CYAN}[{self.done:{w}}/{self.total}]{RESET}"
+            line    = f"{counter}  {target:<20}  {st_s}  {lat_s}{host_s}"
+
+            o = sys.stdout
+            # Move to the bottom of the scroll region and emit \n:
+            # → the region scrolls up one line, cursor stays at v_end on blank row.
+            self._at(self.v_end, 1)
+            o.write("\n")
+            o.write("\033[K")   # clear the blank bottom row
+            o.write(line)       # write new result there
+
+            # Refresh footer stats (outside scroll region — unaffected by scroll).
+            self._draw_stats()
+
+            self._at(self.v_end)  # park cursor back at bottom of viewport
+            o.flush()
+
+    def finish(self):
+        """Restore terminal to normal state after the scan."""
+        with self.lock:
+            o = sys.stdout
+            o.write("\033[r")    # reset scroll region to full screen
+            o.write("\033[?7h")  # re-enable line-wrap
+            o.write("\033[?25h") # show cursor
+            self._at(self.rows)
+            o.write("\n")
+            o.flush()
 
 
-def print_progress(idx: int, total: int, result: dict):
-    """Print one coloured result line (thread-safe)."""
-    status  = result.get("status", "?")
-    target  = result.get("target", "?")
-    lat     = result.get("latency_ms")
-    host    = result.get("hostname") or ""
-    width   = len(str(total))
+class SimpleDisplay:
+    """Fallback for non-TTY output (pipes, redirection) — plain line-by-line."""
 
-    lat_s = f"{lat:.2f}ms" if lat is not None else ""
+    def __init__(self, total: int, workers: int, timeout: int,
+                 out_path, nmap_ver: str):
+        self.total  = total
+        self.lock   = threading.Lock()
+        self.done   = 0
+        self.counts = {"up": 0, "down": 0, "other": 0}
+        bar = "─" * 62
+        print(f"\n{bar}")
+        print(f"  fastcheck  ·  nmap {nmap_ver}")
+        print(f"  Targets: {total}  Workers: {workers}  Timeout: {timeout}s"
+              + (f"  →  {out_path}" if out_path else ""))
+        print(f"{bar}\n")
 
-    if status == "up":
-        status_col = f"{GREEN}{BOLD}up  {RESET}"
-        lat_col    = f"{DIM}{lat_s:<10}{RESET}"
-    elif status == "down":
-        status_col = f"{RED}down{RESET}"
-        lat_col    = " " * 10
-    elif status == "timeout":
-        status_col = f"{YELLOW}tout{RESET}"
-        lat_col    = " " * 10
-    else:
-        status_col = f"{YELLOW}{status[:4]:<4}{RESET}"
-        lat_col    = " " * 10
+    def add_result(self, result: dict):
+        status = result.get("status", "?")
+        target = result.get("target", "?")
+        lat    = result.get("latency_ms")
+        host   = result.get("hostname") or ""
+        w      = len(str(self.total))
+        lat_s  = f"{lat:.2f}ms" if lat is not None else ""
 
-    host_col = f"  {DIM}{host}{RESET}" if host else ""
-    counter  = f"{CYAN}[{idx:{width}}/{total}]{RESET}"
+        with self.lock:
+            self.done += 1
+            s = result.get("status", "other")
+            if   s == "up":   self.counts["up"]    += 1
+            elif s == "down": self.counts["down"]  += 1
+            else:             self.counts["other"] += 1
+            host_s = f"  {host}" if host else ""
+            print(f"[{self.done:{w}}/{self.total}]  {target:<20}  {status:<7}  {lat_s}{host_s}")
 
-    with _print_lock:
-        print(f"{counter}  {target:<22}  {status_col}  {lat_col}{host_col}")
+    def finish(self):
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -279,11 +414,7 @@ def print_progress(idx: int, total: int, result: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def prompt_output_path() -> Path:
-    """
-    Interactively ask the user for the output file path.
-    Called only when multiple targets are scanned and no -o was given.
-    The output file is mandatory in that case.
-    """
+    """Ask the user for an output path (mandatory for multi-target scans)."""
     default = f"fastcheck_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
     while True:
         sys.stdout.write(f"\n{BOLD}Output file{RESET} (required) [{default}]: ")
@@ -291,10 +422,8 @@ def prompt_output_path() -> Path:
         try:
             answer = input().strip()
         except (EOFError, KeyboardInterrupt):
-            print()
-            sys.exit(0)
+            print(); sys.exit(0)
         path = Path(answer if answer else default)
-        # Ensure the parent directory exists
         if not path.parent.exists():
             print(f"  {RED}Directory does not exist: {path.parent}{RESET}")
             continue
@@ -331,17 +460,17 @@ def main():
             "  python fastcheck.py -f targets.txt --up-only\n"
         ),
     )
-    parser.add_argument("target",      nargs="?",      metavar="TARGET",
+    parser.add_argument("target",       nargs="?",     metavar="TARGET",
                         help="IP, CIDR (10.0.0.0/24), range (10.0.0.1-50), or hostname.")
     parser.add_argument("-f", "--file", metavar="FILE",
-                        help="File of targets, one per line (# lines are comments).")
+                        help="File of targets, one per line (# = comment).")
     parser.add_argument("-o", "--output", metavar="FILE",
                         help="Output .jsonl file. Prompted if omitted and multiple targets.")
     parser.add_argument("-w", "--workers", type=int, default=10, metavar="N",
                         help="Parallel nmap processes (default: 10).")
-    parser.add_argument("--timeout",   type=int, default=5,  metavar="SEC",
+    parser.add_argument("--timeout",    type=int, default=5,  metavar="SEC",
                         help="Per-host nmap timeout in seconds (default: 5).")
-    parser.add_argument("--up-only",   action="store_true",
+    parser.add_argument("--up-only",    action="store_true",
                         help="Only write 'up' hosts to the output file.")
 
     args = parser.parse_args()
@@ -351,75 +480,52 @@ def main():
     total        = len(targets)
     multi        = total > 1
 
-    # ── Resolve output path ───────────────────────────────────────────────────
-    # Single target: optional. Multiple targets: mandatory (prompt if not given).
+    # Output path: single target → optional; multiple → mandatory, prompt if absent.
     out_path = None
     if args.output:
         out_path = Path(args.output)
     elif multi:
         out_path = prompt_output_path()
 
-    # ── Print scan header ─────────────────────────────────────────────────────
-    bar = "─" * 62
-    print(f"\n{BOLD}{CYAN}{bar}{RESET}")
-    print(f"{BOLD}  fastcheck  ·  nmap {NMAP_VERSION}{RESET}")
-    print(f"  Targets  : {total}")
-    print(f"  Workers  : {args.workers}")
-    print(f"  Timeout  : {args.timeout}s / host")
-    if out_path:
-        print(f"  Output   : {out_path}")
-    print(f"{BOLD}{CYAN}{bar}{RESET}\n")
-
-    # ── Concurrent scan ───────────────────────────────────────────────────────
-    counts    = {"up": 0, "down": 0, "other": 0}
-    idx_state = {"n": 0}
-    idx_lock  = threading.Lock()
-    cnt_lock  = threading.Lock()
-
-    def run_one(entry: dict, fh):
-        result          = scan_host(entry["target"], args.timeout)
-        result["input"] = entry["input"]   # original spec (e.g. "10.0.0.0/24")
-
-        with idx_lock:
-            idx_state["n"] += 1
-            idx = idx_state["n"]
-
-        print_progress(idx, total, result)
-
-        s = result.get("status", "other")
-        with cnt_lock:
-            if   s == "up":   counts["up"]    += 1
-            elif s == "down": counts["down"]  += 1
-            else:             counts["other"] += 1
-
-        if fh and (not args.up_only or s == "up"):
-            write_record(fh, result)
+    # Choose display: live TUI for interactive terminal, plain text for pipes.
+    Display = LiveDisplay if sys.stdout.isatty() else SimpleDisplay
+    display = Display(total, args.workers, args.timeout, out_path, NMAP_VERSION)
 
     fh = open(out_path, "w", encoding="utf-8") if out_path else None
 
+    def run_one(entry: dict):
+        result          = scan_host(entry["target"], args.timeout)
+        result["input"] = entry["input"]
+        display.add_result(result)
+        if fh and (not args.up_only or result.get("status") == "up"):
+            write_record(fh, result)
+
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(run_one, e, fh) for e in targets]
+            futures = [pool.submit(run_one, e) for e in targets]
             for future in as_completed(futures):
-                future.result()   # surface any unexpected exception
+                future.result()
     except KeyboardInterrupt:
-        print(f"\n{YELLOW}Interrupted — partial results saved.{RESET}")
+        pass
     finally:
+        display.finish()
         if fh:
             fh.close()
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\n{BOLD}{CYAN}{'─' * 62}{RESET}")
+    # Print final summary after display is torn down.
+    c   = display.counts
+    bar = "─" * 62
+    print(f"{BOLD}{CYAN}{bar}{RESET}")
     print(f"{BOLD}  Summary{RESET}")
-    print(f"  {GREEN}Up     : {counts['up']}{RESET}")
-    print(f"  {RED}Down   : {counts['down']}{RESET}")
-    if counts["other"]:
-        print(f"  {YELLOW}Other  : {counts['other']}{RESET}")
-    total_records = counts["up"] + counts["down"] + counts["other"]
+    print(f"  {GREEN}Up     : {c['up']}{RESET}")
+    print(f"  {RED}Down   : {c['down']}{RESET}")
+    if c["other"]:
+        print(f"  {YELLOW}Other  : {c['other']}{RESET}")
     if out_path and out_path.exists():
-        sz = out_path.stat().st_size
-        print(f"  Output : {out_path}  ({sz:,} bytes, {total_records} records)")
-    print(f"{BOLD}{CYAN}{'─' * 62}{RESET}\n")
+        sz    = out_path.stat().st_size
+        total_rec = c["up"] + c["down"] + c["other"]
+        print(f"  Output : {out_path}  ({sz:,} bytes, {total_rec} records)")
+    print(f"{BOLD}{CYAN}{bar}{RESET}\n")
 
 
 if __name__ == "__main__":
