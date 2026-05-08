@@ -1,0 +1,5 @@
+# reconn/ipinfo
+-r reconn/ipinfo/requirements.txt
+
+# reconn/ip2location
+-r reconn/ip2location/requirements.txt
