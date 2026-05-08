@@ -3,3 +3,7 @@
 
 # output file for local test
 *.jsonl
+
+
+# add python cache
+*__pycache__
