@@ -6,3 +6,6 @@
 
 # reconn/fastcheck  (no pip packages; requires nmap system binary)
 -r reconn/fastcheck/requirements.txt
+
+# reconn/scantop100  (no pip packages; requires nmap system binary)
+-r reconn/scantop100/requirements.txt

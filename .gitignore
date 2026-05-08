@@ -7,3 +7,8 @@
 
 # add python cache
 *__pycache__
+
+
+# Test targets and results
+*target.test
+*jsonl.test
