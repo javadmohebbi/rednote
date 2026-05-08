@@ -2,7 +2,8 @@
 
 Rapid host-discovery scanner using `nmap -sn` (ping scan).  
 Handles single IPs, CIDRs, ranges, and multi-million-target files with flat memory usage.  
-Results stream live inside a fixed terminal view — the screen never scrolls.
+Results stream live inside a fixed terminal view — the screen never scrolls.  
+Supports **pause**, **resume from pause**, and **resume after being stopped**.
 
 ## Quick start
 
@@ -20,6 +21,10 @@ python fastcheck.py 10.0.0.0/8 --light -w 100 -o results.jsonl
 
 # File of targets (any mix of IPs, CIDRs, ranges)
 sudo python fastcheck.py -f targets.txt -o results.jsonl --up-only
+
+# Resume a stopped scan — re-run the same command
+python fastcheck.py 10.0.0.0/8 --light -w 100 -o results.jsonl
+# Output: Resume: 4821 hosts already scanned, 11955393 remaining.
 ```
 
 ## Prerequisites
@@ -177,6 +182,38 @@ python fastcheck.py -f chunk_N.txt --light -w 100 --up-only -o results_N.jsonl
 
 ---
 
+## Pause and resume
+
+### Pause during a scan
+
+Press **Ctrl+C**. Workers finish scanning their current host, then wait.  
+The footer updates to show the paused state:
+
+```
+  Up: 312    Down: 6414    [████░░░░░░░░░░]  6726/16777214  ⏸ PAUSED  ↵ resume  ·  Ctrl+C quit
+```
+
+Press **Enter** to resume. Press **Ctrl+C** again to quit.
+
+### Resume after the process was stopped
+
+Re-run the **exact same command**. Already-scanned hosts are read from the
+output file and skipped automatically — the scan picks up from where it left off.
+
+```bash
+# First run — killed or Ctrl+C'd at host 4821
+python fastcheck.py 10.0.0.0/8 --light -w 100 -o results.jsonl
+
+# Re-run — continues from host 4822
+python fastcheck.py 10.0.0.0/8 --light -w 100 -o results.jsonl
+# Resume: 4821 hosts already scanned, 11955393 remaining.
+```
+
+The output file is opened in **append mode** on resume, so no completed records are lost.  
+If the output file is deleted, the scan restarts from scratch.
+
+---
+
 ## Live display
 
 When run in an interactive terminal the screen is split into three fixed zones.
@@ -289,5 +326,7 @@ grep -c '"status":"up"' results.jsonl
 - **Memory**: target expansion is fully lazy — a `/8` (16 M hosts) uses the same few MB of RAM as a single IP.
 - **Task queue**: at most `workers × 4` nmap processes are queued at once. The rest wait in the generator, consuming no memory.
 - **Results are unordered**: threads complete in parallel; `[X/N]` shows completion order, not input order. Input order is preserved in the `input` field.
+- **Pause**: Ctrl+C pauses; workers finish their current host before stopping. Enter resumes; second Ctrl+C quits.
+- **Resume**: the output file is the resume state — re-run the same command to skip already-scanned hosts and continue from where it stopped.
 - **Interrupted scans**: the output file is flushed after every result — valid JSONL even if stopped early with Ctrl-C.
 - **Non-TTY mode**: when stdout is a pipe or file, the live TUI is replaced with plain line-by-line output and no cursor movement.

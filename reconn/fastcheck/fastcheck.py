@@ -23,6 +23,8 @@ Prerequisites
 
 import sys
 import json
+import time
+import signal
 import shutil
 import argparse
 import ipaddress
@@ -49,7 +51,54 @@ NMAP_VERSION = "unknown"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1 — Target expansion
+# 1 — Pause / quit control
+# ══════════════════════════════════════════════════════════════════════════════
+
+_pause_event = threading.Event()
+_quit_event  = threading.Event()
+
+
+def _sigint_handler(sig, frame):
+    if _pause_event.is_set():
+        _quit_event.set()
+        _pause_event.clear()
+    else:
+        _pause_event.set()
+
+
+def wait_if_paused(display) -> bool:
+    """
+    Block the calling worker until resumed or quit.
+    Returns False if quit was requested (caller should exit).
+    """
+    if not _pause_event.is_set():
+        return True
+
+    display.set_paused(True)
+
+    resume_signal = threading.Event()
+
+    def _read_enter():
+        try:
+            sys.stdin.readline()
+        except Exception:
+            pass
+        resume_signal.set()
+
+    threading.Thread(target=_read_enter, daemon=True).start()
+
+    while _pause_event.is_set() and not _quit_event.is_set():
+        if resume_signal.is_set():
+            _pause_event.clear()
+            break
+        time.sleep(0.1)
+
+    display.set_paused(False)
+    return not _quit_event.is_set()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2 — Target expansion
 # ══════════════════════════════════════════════════════════════════════════════
 
 def expand_target(raw: str) -> list:
@@ -169,7 +218,7 @@ def iter_targets(raw_list: list):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2 — nmap wrapper
+# 3 — nmap wrapper
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_nmap() -> str:
@@ -332,7 +381,7 @@ def _parse_nmap_xml(xml: str, result: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3 — Live display
+# 4 — Live display
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # Layout (all row numbers are 1-indexed):
@@ -368,6 +417,7 @@ class LiveDisplay:
         self.lock    = threading.Lock()
         self.done    = 0
         self.counts  = {"up": 0, "down": 0, "other": 0}
+        self._paused = False
 
         o   = sys.stdout
         bar = "─" * cols
@@ -414,14 +464,25 @@ class LiveDisplay:
 
         self._at(self.f_stats)
         o.write("\033[K")
-        o.write(
+        base = (
             f"  {GREEN}Up: {up:<5}{RESET}"
             f"  {RED}Down: {down:<5}{RESET}"
             f"  {CYAN}[{bar}]{RESET}"
             f"  {done}/{self.total}"
         )
+        if self._paused:
+            o.write(base + f"  {YELLOW}{BOLD}⏸ PAUSED{RESET}  ↵ resume  ·  Ctrl+C quit")
+        else:
+            o.write(base)
 
     # ── Public ────────────────────────────────────────────────────────────────
+
+    def set_paused(self, paused: bool):
+        with self.lock:
+            self._paused = paused
+            self._draw_stats()
+            self._at(self.v_end)
+            sys.stdout.flush()
 
     def add_result(self, result: dict):
         """Append one result line to the scrolling viewport (thread-safe)."""
@@ -506,6 +567,10 @@ class SimpleDisplay:
               + (f"  →  {out_path}" if out_path else ""))
         print(f"{bar}\n")
 
+    def set_paused(self, paused: bool):
+        if paused:
+            print("[PAUSED]  Press Enter to resume or Ctrl+C to quit...")
+
     def add_result(self, result: dict):
         status = result.get("status", "?")
         target = result.get("target", "?")
@@ -530,7 +595,7 @@ class SimpleDisplay:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4 — Output file
+# 5 — Output file
 # ══════════════════════════════════════════════════════════════════════════════
 
 def prompt_output_path() -> Path:
@@ -550,6 +615,25 @@ def prompt_output_path() -> Path:
         return path
 
 
+def load_completed(out_path: Path) -> set:
+    """
+    Read the output file and return the set of already-scanned targets.
+    Re-running the same command skips these hosts so the scan resumes cleanly.
+    """
+    completed = set()
+    if not out_path or not out_path.exists():
+        return completed
+    with open(out_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+                if "target" in r:
+                    completed.add(r["target"])
+            except json.JSONDecodeError:
+                pass
+    return completed
+
+
 _file_lock = threading.Lock()
 
 
@@ -561,7 +645,7 @@ def write_record(fh, record: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5 — CLI
+# 6 — CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -620,14 +704,31 @@ def main():
     elif multi:
         out_path = prompt_output_path()
 
+    # ── Resume: skip already-scanned hosts ────────────────────────────────────
+    completed = load_completed(out_path)
+    remaining = total - len(completed)
+    if completed:
+        print(
+            f"\n{YELLOW}Resume:{RESET} {len(completed):,} hosts already scanned, "
+            f"{remaining:,} remaining."
+        )
+
+    # ── Register Ctrl+C for pause/quit ────────────────────────────────────────
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     # Choose display: live TUI for interactive terminal, plain text for pipes.
     Display = LiveDisplay if sys.stdout.isatty() else SimpleDisplay
-    display = Display(total, args.workers, timeout, out_path, NMAP_VERSION,
-                      light=args.light)
+    display = Display(remaining or total, args.workers, timeout, out_path,
+                      NMAP_VERSION, light=args.light)
 
-    fh = open(out_path, "w", encoding="utf-8") if out_path else None
+    # Open file: append on resume, fresh write otherwise.
+    fh = open(out_path, "a" if completed else "w", encoding="utf-8") if out_path else None
 
     def run_one(entry: dict):
+        if not wait_if_paused(display):
+            return
+        if _quit_event.is_set():
+            return
         result          = scan_host(entry["target"], timeout, light=args.light)
         result["input"] = entry["input"]
         display.add_result(result)
@@ -642,22 +743,21 @@ def main():
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            gen     = iter_targets(raw_list)
+            gen     = (e for e in iter_targets(raw_list) if e["target"] not in completed)
             pending = set()
 
-            # Prime the window
             for entry in itertools.islice(gen, MAX_PENDING):
                 pending.add(pool.submit(run_one, entry))
 
-            # Slide: as futures finish, retire them and submit new ones
-            while pending:
+            while pending and not _quit_event.is_set():
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for f in done:
-                    f.result()                              # surface exceptions
-                for entry in itertools.islice(gen, len(done)):
-                    pending.add(pool.submit(run_one, entry))
+                    f.result()
+                if not _quit_event.is_set():
+                    for entry in itertools.islice(gen, len(done)):
+                        pending.add(pool.submit(run_one, entry))
 
-    except KeyboardInterrupt:
+    except Exception:
         pass
     finally:
         display.finish()
@@ -674,9 +774,13 @@ def main():
     if c["other"]:
         print(f"  {YELLOW}Other  : {c['other']}{RESET}")
     if out_path and out_path.exists():
-        sz    = out_path.stat().st_size
+        sz        = out_path.stat().st_size
         total_rec = c["up"] + c["down"] + c["other"]
         print(f"  Output : {out_path}  ({sz:,} bytes, {total_rec} records)")
+    if _quit_event.is_set() and out_path:
+        print(
+            f"\n  {YELLOW}Scan stopped — re-run the same command to continue.{RESET}"
+        )
     print(f"{BOLD}{CYAN}{bar}{RESET}\n")
 
 
