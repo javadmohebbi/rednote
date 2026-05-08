@@ -604,7 +604,130 @@ def write_record(fh, record: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7 — CLI
+# 7 — Analysis / report
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze(path: Path):
+    """
+    Print a human-readable report from a scantop100 .jsonl file.
+    Designed to be piped to  | less  or  | less -R  (colours on TTY only).
+
+    Layout
+      ─ Summary header: total hosts, open-port count, top services
+      ─ One block per host that has open ports (sorted by IP)
+      ─ Compact footer: hosts with no open ports / errors
+    """
+    if not path.exists():
+        sys.exit(f"[ERROR] File not found: {path}")
+
+    records = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    if not records:
+        sys.exit(f"[ERROR] No records found in {path}")
+
+    # Colours only when writing to a terminal; plain text when piped.
+    tty = sys.stdout.isatty()
+    def _c(code, text): return f"{code}{text}{RESET}" if tty else str(text)
+
+    wide  = "═" * 62
+    thin  = "─" * 62
+    dthin = "┄" * 62
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+    with_ports  = [r for r in records if r.get("open_ports")]
+    no_ports    = [r for r in records if not r.get("open_ports")
+                   and r.get("host_status") not in ("timeout", "error")]
+    errors      = [r for r in records if r.get("host_status") in ("timeout", "error", "no_response")]
+    all_ports   = [p for r in records for p in r.get("ports", [])]
+
+    # Count occurrences of each service name
+    svc_count: dict = {}
+    for p in all_ports:
+        s = p.get("service", "").strip()
+        if s:
+            svc_count[s] = svc_count.get(s, 0) + 1
+    top_svcs = sorted(svc_count.items(), key=lambda x: -x[1])[:8]
+
+    print()
+    print(_c(BOLD + CYAN, wide))
+    print(_c(BOLD,         f"  {path}"))
+    print(_c(BOLD + CYAN, wide))
+    print(f"  Hosts scanned    : {len(records)}")
+    print(f"  With open ports  : {_c(GREEN, len(with_ports))}")
+    print(f"  No open ports    : {len(no_ports)}")
+    print(f"  Errors / timeout : {_c(YELLOW, len(errors)) if errors else '0'}")
+    print(f"  Total open ports : {len(all_ports)}")
+    if top_svcs:
+        svc_line = "  ".join(f"{s}({n})" for s, n in top_svcs)
+        print(f"  Top services     : {_c(CYAN, svc_line)}")
+    print(_c(BOLD + CYAN, wide))
+
+    if not with_ports:
+        print("\n  No hosts with open ports found.\n")
+        return
+
+    # ── Per-host detail (sorted by IP when possible, else alphabetically) ─────
+    def _sort_key(r):
+        try:
+            return (0, int(ipaddress.ip_address(r.get("target", ""))),)
+        except ValueError:
+            return (1, r.get("target", ""),)
+
+    print()
+    for r in sorted(with_ports, key=_sort_key):
+        target   = r.get("target",   "?")
+        hostname = r.get("hostname") or ""
+        ports    = r.get("ports",    [])
+        duration = r.get("scan_duration_s")
+        dur_s    = f"  {DIM}({duration:.0f}s){RESET}" if tty and duration else (f"  ({duration:.0f}s)" if duration else "")
+
+        host_label = _c(BOLD, f"  {target}")
+        if hostname:
+            host_label += f"  {_c(DIM, '·')}  {_c(YELLOW, hostname)}"
+        host_label += dur_s
+
+        print(_c(CYAN, thin))
+        print(host_label)
+        print(_c(DIM, thin))
+
+        for p in ports:
+            port_s    = f"{p['port']}/{p['protocol']}"
+            service_s = p.get("service", "")
+            version_s = p.get("version", "")
+            if tty:
+                print(f"  {_c(GREEN, port_s):<20}  {_c(CYAN, service_s):<24}  {version_s}")
+            else:
+                print(f"  {port_s:<12}  {service_s:<15}  {version_s}")
+        print()
+
+    # ── Compact footer: hosts without open ports ───────────────────────────────
+    if no_ports or errors:
+        print(_c(DIM, dthin))
+        if no_ports:
+            print(_c(DIM, f"  No open ports ({len(no_ports)}):"))
+            for r in sorted(no_ports, key=_sort_key):
+                host = r.get("target", "?")
+                hn   = f"  ({r['hostname']})" if r.get("hostname") else ""
+                print(_c(DIM, f"    {host}{hn}"))
+        if errors:
+            print(_c(YELLOW, f"\n  Errors / timeout ({len(errors)}):"))
+            for r in sorted(errors, key=_sort_key):
+                host  = r.get("target", "?")
+                st    = r.get("host_status", "?")
+                err   = r.get("error", "")
+                extra = f"  {err[:60]}" if err else f"  ({st})"
+                print(_c(YELLOW, f"    {host}{extra}"))
+        print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8 — CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -634,8 +757,16 @@ def main():
                         help="Per-host nmap timeout in seconds (default: 120).")
     parser.add_argument("--open-only",  action="store_true",
                         help="Only write hosts with at least one open port.")
+    parser.add_argument("--analyze",    metavar="FILE",
+                        help="Read a .jsonl result file and print a human-readable "
+                             "report. Pipe to  | less  or  | less -R  for paging.")
 
     args = parser.parse_args()
+
+    # ── Analysis mode — read a result file and report, then exit ─────────────
+    if args.analyze:
+        analyze(Path(args.analyze))
+        sys.exit(0)
 
     NMAP_VERSION  = check_nmap()
     total, gen_fn = resolve_targets(args)

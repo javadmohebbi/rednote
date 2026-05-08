@@ -18,6 +18,10 @@ python scantop100.py 192.168.1.0/24 -o ports.jsonl
 
 # Only save hosts that have open ports
 python scantop100.py -f targets.jsonl -o ports.jsonl --open-only
+
+# Analyze results on screen
+python scantop100.py --analyze ports.jsonl
+python scantop100.py --analyze ports.jsonl | less -R
 ```
 
 ## Prerequisites
@@ -39,14 +43,78 @@ python scantop100.py [options] [TARGET]
 Positional:
   TARGET              IP, CIDR, range (10.0.0.1-50), or hostname
 
-Options:
+Scan options:
   -f, --file FILE     Target file: plain text (one per line) or fastcheck .jsonl
   -o, --output FILE   Output .jsonl file
                       Optional for single targets; prompted (mandatory) for multiple
   -w, --workers N     Parallel nmap processes (default: 5)
   --timeout SEC       Per-host nmap timeout in seconds (default: 120)
   --open-only         Only write hosts with at least one open port
+
+Analysis:
+  --analyze FILE      Read a .jsonl result file and print a human-readable report
+                      Pipe to  | less  or  | less -R  for paging
 ```
+
+---
+
+## Analyzing results
+
+After a scan, use `--analyze` to get a structured human-readable report on screen:
+
+```bash
+python scantop100.py --analyze ports.jsonl
+```
+
+Pipe to `less` for paging (plain text, no colour codes):
+
+```bash
+python scantop100.py --analyze ports.jsonl | less
+```
+
+Keep colours with `less -R`:
+
+```bash
+python scantop100.py --analyze ports.jsonl | less -R
+```
+
+### Report layout
+
+```
+══════════════════════════════════════════════════════════════
+  ports.jsonl
+══════════════════════════════════════════════════════════════
+  Hosts scanned    : 5
+  With open ports  : 3
+  No open ports    : 1
+  Errors / timeout : 1
+  Total open ports : 8
+  Top services     : ssh(2)  http(2)  https(2)  mysql(1)
+══════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────────────
+  10.0.0.1  ·  router.internal  (18s)
+──────────────────────────────────────────────────────────────
+  22/tcp        ssh              OpenSSH 9.2p1 Debian 2
+  80/tcp        http             Apache httpd 2.4.57
+  443/tcp       https
+
+──────────────────────────────────────────────────────────────
+  10.0.0.5  ·  db01.internal  (22s)
+──────────────────────────────────────────────────────────────
+  22/tcp        ssh              OpenSSH 8.9p1
+  3306/tcp      mysql            MySQL 8.0.32
+
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+  No open ports (1):
+    10.0.0.9
+
+  Errors / timeout (1):
+    10.0.0.12  (timeout)
+```
+
+Colours are applied when writing to a terminal and stripped automatically when piped.  
+Hosts are sorted by IP address. The footer lists hosts with no open ports and any errors.
 
 ---
 
