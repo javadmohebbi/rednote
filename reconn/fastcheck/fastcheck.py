@@ -149,14 +149,34 @@ def check_nmap() -> str:
         sys.exit(f"[ERROR] Cannot run nmap: {exc}")
 
 
-def scan_host(target: str, timeout: int) -> dict:
-    """
-    Run  nmap -sn -T4  against a single target and return a result dict.
+# Probe flags used by each scan mode.
+# Default (high-accuracy): combines TCP SYN, TCP ACK, UDP, ICMP echo, and
+#   ICMP timestamp probes so that hosts which silently drop one probe type
+#   are still discovered via another.
+# Light: ICMP echo + ARP only — fast, but misses firewalled/filtered hosts.
+PROBES_DEFAULT = ["-PS22,80,443", "-PA80,443", "-PU161", "-PE", "-PP"]
+PROBES_LIGHT   = []   # nmap's built-in default (ICMP echo + ARP)
 
-    -sn           ping scan only (ICMP echo + ARP) — no port scanning
-    -T4           aggressive timing for faster responses
-    --host-timeout cap per-host wait time
-    -oX -         XML output to stdout for reliable parsing
+
+def scan_host(target: str, timeout: int, light: bool = False) -> dict:
+    """
+    Run nmap -sn against a single target and return a result dict.
+
+    Default (high-accuracy) probes
+      -PS22,80,443   TCP SYN ping   → discovers hosts that answer on SSH/HTTP/HTTPS
+      -PA80,443      TCP ACK ping   → bypasses stateful firewalls that drop SYN
+      -PU161         UDP ping       → discovers SNMP devices and UDP-only hosts
+      -PE            ICMP echo      → classic ping
+      -PP            ICMP timestamp → fallback for hosts that block echo but allow timestamp
+
+    Light probes (--light)
+      nmap default: ICMP echo + ARP (fast, less thorough)
+
+    Common flags
+      -sn            no port scan — host discovery only
+      -T4            aggressive timing for faster responses
+      --host-timeout cap per-host wait time
+      -oX -          XML output to stdout for reliable parsing
     """
     result = {
         "timestamp":    datetime.now(tz=timezone.utc).isoformat(),
@@ -166,14 +186,13 @@ def scan_host(target: str, timeout: int) -> dict:
         "latency_ms":   None,
         "hostname":     None,
         "mac":          None,
+        "scan_mode":    "light" if light else "default",
         "nmap_version": NMAP_VERSION,
     }
+    probes = PROBES_LIGHT if light else PROBES_DEFAULT
+    cmd = ["nmap", "-sn"] + probes + ["-T4", "--host-timeout", f"{timeout}s", "-oX", "-", target]
     try:
-        proc = subprocess.run(
-            ["nmap", "-sn", "-T4", "--host-timeout", f"{timeout}s", "-oX", "-", target],
-            capture_output=True,
-            timeout=timeout + 10,
-        )
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
         _parse_nmap_xml(proc.stdout.decode(errors="replace"), result)
     except subprocess.TimeoutExpired:
         result["status"] = "timeout"
@@ -245,7 +264,7 @@ class LiveDisplay:
     FOOTER = 3   # fixed rows at bottom (sep + stats + blank)
 
     def __init__(self, total: int, workers: int, timeout: int,
-                 out_path, nmap_ver: str):
+                 out_path, nmap_ver: str, light: bool = False):
         cols, rows = shutil.get_terminal_size((80, 24))
         self.total   = total
         self.cols    = cols
@@ -258,8 +277,9 @@ class LiveDisplay:
         self.done    = 0
         self.counts  = {"up": 0, "down": 0, "other": 0}
 
-        o  = sys.stdout
+        o   = sys.stdout
         bar = "─" * cols
+        mode_s = f"{DIM}light{RESET}" if light else f"{GREEN}default (high-accuracy){RESET}"
 
         o.write("\033[2J\033[H")    # clear screen, cursor home
         o.write("\033[?25l")        # hide cursor
@@ -267,7 +287,7 @@ class LiveDisplay:
 
         # ── Fixed header ──────────────────────────────────────────────────────
         self._at(1); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
-        self._at(2); o.write(f"{BOLD}  fastcheck  ·  nmap {nmap_ver}{RESET}")
+        self._at(2); o.write(f"{BOLD}  fastcheck  ·  nmap {nmap_ver}  ·  {mode_s}{RESET}")
         self._at(3)
         info = f"  Targets: {total}  Workers: {workers}  Timeout: {timeout}s"
         if out_path:
@@ -376,14 +396,15 @@ class SimpleDisplay:
     """Fallback for non-TTY output (pipes, redirection) — plain line-by-line."""
 
     def __init__(self, total: int, workers: int, timeout: int,
-                 out_path, nmap_ver: str):
+                 out_path, nmap_ver: str, light: bool = False):
         self.total  = total
         self.lock   = threading.Lock()
         self.done   = 0
         self.counts = {"up": 0, "down": 0, "other": 0}
-        bar = "─" * 62
+        bar    = "─" * 62
+        mode_s = "light" if light else "default (high-accuracy)"
         print(f"\n{bar}")
-        print(f"  fastcheck  ·  nmap {nmap_ver}")
+        print(f"  fastcheck  ·  nmap {nmap_ver}  ·  {mode_s}")
         print(f"  Targets: {total}  Workers: {workers}  Timeout: {timeout}s"
               + (f"  →  {out_path}" if out_path else ""))
         print(f"{bar}\n")
@@ -468,8 +489,13 @@ def main():
                         help="Output .jsonl file. Prompted if omitted and multiple targets.")
     parser.add_argument("-w", "--workers", type=int, default=10, metavar="N",
                         help="Parallel nmap processes (default: 10).")
-    parser.add_argument("--timeout",    type=int, default=5,  metavar="SEC",
-                        help="Per-host nmap timeout in seconds (default: 5).")
+    parser.add_argument("--timeout",    type=int, default=None, metavar="SEC",
+                        help="Per-host nmap timeout in seconds "
+                             "(default: 10 for default scan, 5 for --light).")
+    parser.add_argument("--light",      action="store_true",
+                        help="Use ICMP echo + ARP only (faster, less thorough). "
+                             "Default scan uses TCP SYN/ACK, UDP, and ICMP probes "
+                             "for higher accuracy.")
     parser.add_argument("--up-only",    action="store_true",
                         help="Only write 'up' hosts to the output file.")
 
@@ -480,6 +506,12 @@ def main():
     total        = len(targets)
     multi        = total > 1
 
+    # Timeout: default scan uses more probes and needs more time.
+    if args.timeout is not None:
+        timeout = args.timeout
+    else:
+        timeout = 5 if args.light else 10
+
     # Output path: single target → optional; multiple → mandatory, prompt if absent.
     out_path = None
     if args.output:
@@ -489,12 +521,13 @@ def main():
 
     # Choose display: live TUI for interactive terminal, plain text for pipes.
     Display = LiveDisplay if sys.stdout.isatty() else SimpleDisplay
-    display = Display(total, args.workers, args.timeout, out_path, NMAP_VERSION)
+    display = Display(total, args.workers, timeout, out_path, NMAP_VERSION,
+                      light=args.light)
 
     fh = open(out_path, "w", encoding="utf-8") if out_path else None
 
     def run_one(entry: dict):
-        result          = scan_host(entry["target"], args.timeout)
+        result          = scan_host(entry["target"], timeout, light=args.light)
         result["input"] = entry["input"]
         display.add_result(result)
         if fh and (not args.up_only or result.get("status") == "up"):
