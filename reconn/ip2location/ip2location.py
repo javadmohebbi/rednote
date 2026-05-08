@@ -822,6 +822,8 @@ def main():
                         help="Show all databases with download status, then exit.")
     parser.add_argument("--json",     action="store_true",
                         help="Output as JSON. Single IP → object; multiple IPs → array.")
+    parser.add_argument("--csv",      action="store_true",
+                        help="Output as CSV with a header row.")
     parser.add_argument("--reverse-country", metavar="CC",
                         help="Find CIDR ranges for a country code (e.g. US, DE, JP)."
                              " Requires DB1CIDR or DB3CIDR to be downloaded.")

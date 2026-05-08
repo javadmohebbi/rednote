@@ -1,3 +1,5 @@
 .env
 *.BIN
 *.bin
+*.CIDR
+*.CSV
