@@ -21,6 +21,7 @@ Prerequisites
 import sys
 import os
 import io
+import csv
 import json
 import socket
 import zipfile
@@ -171,6 +172,19 @@ CATALOG: dict = {
                  fields=["is_proxy", "proxy_type", "country_code", "country_name",
                          "isp", "domain", "usage_type", "asn", "as_name",
                          "threat", "provider", "fraud_score", "last_seen"]),
+
+    # ── CIDR CSV editions  (used for reverse lookup: country/city → IP ranges) ─
+    # These are CSV files with one CIDR range per row — ideal for filtering by
+    # country or city without scanning a binary index.
+    "DB1CIDR": dict(code="DB1LITECIDR", zip_name="IP2LOCATION-LITE-DB1.CIDR",
+                    kind="cidr",
+                    desc="Country CIDR ranges  (fastest for --reverse-country)",
+                    fields=["cidr", "country_code", "country_name"]),
+
+    "DB3CIDR": dict(code="DB3LITECIDR", zip_name="IP2LOCATION-LITE-DB3.CIDR",
+                    kind="cidr",
+                    desc="Country + Region + City CIDR ranges  (for --reverse-city)",
+                    fields=["cidr", "country_code", "country_name", "region", "city"]),
 }
 
 # When no --db is given, auto-mode picks the richest available DB from each group.
@@ -327,6 +341,10 @@ def list_databases():
     print(f"\n{BOLD}Proxy / VPN detection{RESET}  (each level is cumulative)")
     for n in ["PX1", "PX2", "PX3", "PX4", "PX5",
               "PX6", "PX7", "PX8", "PX9", "PX11"]:
+        _line(n)
+
+    print(f"\n{BOLD}CIDR CSV databases{RESET}  (needed for --reverse-country / --reverse-city)")
+    for n in ["DB1CIDR", "DB3CIDR"]:
         _line(n)
 
     total = sum(1 for n in CATALOG if _downloaded(n))
@@ -523,7 +541,83 @@ def lookup(ip: str, db_name: str | None = None) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8 — Display
+# 8 — Reverse lookup  (country code or city → CIDR ranges)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def reverse_lookup(country_code: str | None = None,
+                   city: str | None = None,
+                   limit: int = 20) -> list:
+    """
+    Scan a CIDR CSV database and return rows matching *country_code* or *city*.
+
+    Requires DB1CIDR (country-only, ~15 MB) or DB3CIDR (+ region/city, ~232 MB).
+    Download with:  python ip2location.py --download DB1CIDR
+                    python ip2location.py --download DB3CIDR
+    """
+    # Choose the smallest sufficient CSV for the query.
+    if city:
+        csv_name = "DB3CIDR"
+    else:
+        # DB1CIDR is enough for country-only; fall back to DB3CIDR if that's what's available.
+        csv_name = "DB1CIDR" if _downloaded("DB1CIDR") else \
+                   "DB3CIDR" if _downloaded("DB3CIDR") else None
+
+    if csv_name is None or not _downloaded(csv_name):
+        needed = "DB3CIDR" if city else "DB1CIDR"
+        print(
+            f"[ERROR] {needed} not downloaded.\n"
+            f"        Run: python ip2location.py --download {needed}",
+            file=sys.stderr,
+        )
+        return []
+
+    path  = _db_path(csv_name)
+    cols  = CATALOG[csv_name]["fields"]   # ["cidr", "country_code", ...]
+    cc    = country_code.upper()          if country_code else None
+    city_lc = city.lower()               if city         else None
+    results = []
+
+    try:
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            reader = csv.reader(fh)
+
+            # Sniff the first row; skip it if it looks like a header.
+            first = next(reader, None)
+            if first and not any("/" in v for v in first):
+                pass   # it was a header row — already consumed, continue below
+            elif first:
+                # First row is data — process it now before the loop.
+                row_dict = dict(zip(cols, first))
+                if _rev_match(row_dict, cc, city_lc):
+                    results.append(row_dict)
+
+            for row in reader:
+                if len(row) < len(cols):
+                    continue
+                row_dict = dict(zip(cols, row))
+                if _rev_match(row_dict, cc, city_lc):
+                    results.append(row_dict)
+                    if limit and len(results) >= limit:
+                        break
+
+    except Exception as e:
+        print(f"[ERROR] Could not read {path}: {e}", file=sys.stderr)
+        return []
+
+    return results
+
+
+def _rev_match(row: dict, cc: str | None, city_lc: str | None) -> bool:
+    """Return True if the row matches the given country code and/or city filter."""
+    if cc and row.get("country_code", "").strip('"').upper() != cc:
+        return False
+    if city_lc and city_lc not in row.get("city", "").strip('"').lower():
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9 — Display
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Fields in preferred display order.  country_name and longitude are handled
@@ -654,8 +748,48 @@ def print_table(results: list):
     print()
 
 
+def print_reverse(rows: list, label: str, total_hint: str = ""):
+    """Display reverse-lookup results (list of CIDR row dicts)."""
+    if not rows:
+        print(f"  No results found for {label}")
+        return
+
+    hint = f"  {DIM}(showing {len(rows)}{total_hint}){RESET}" if total_hint else ""
+    print(f"\n{BOLD}CIDR ranges for {label}{RESET}{hint}\n")
+
+    has_city = any(r.get("city") for r in rows)
+
+    if has_city:
+        # Wide table: CIDR | country | region | city
+        cols = [("CIDR", 20), ("CC", 4), ("Region", 18), ("City", 22)]
+        header = "  ".join(f"{h:<{w}}" for h, w in cols)
+        sep    = "  ".join("─" * w       for _, w in cols)
+        print(f"{BOLD}{header}{RESET}")
+        print(f"{DIM}{sep}{RESET}")
+
+        def _trunc(s, w):
+            return s if len(s) <= w else s[: w - 1] + "…"
+
+        for r in rows:
+            cidr   = r.get("cidr", "-").strip('"')
+            cc     = r.get("country_code", "-").strip('"')
+            region = r.get("region", "-").strip('"')
+            city   = r.get("city", "-").strip('"')
+            vals   = [cidr, cc, region, city]
+            print("  ".join(f"{_trunc(v, w):<{w}}" for v, (_, w) in zip(vals, cols)))
+    else:
+        # Compact two-column list: CIDR | country
+        for r in rows:
+            cidr = r.get("cidr", "-").strip('"')
+            cc   = r.get("country_code", "-").strip('"')
+            cn   = r.get("country_name", "").strip('"')
+            print(f"  {cidr:<22}  {DIM}{cc}  {cn}{RESET}")
+
+    print()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# 9 — CLI
+# 10 — CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -670,6 +804,8 @@ def main():
             "  python ip2location.py 8.8.8.8\n"
             "  python ip2location.py --db PX7 8.8.8.8 1.1.1.1\n"
             "  python ip2location.py --json 8.8.8.8\n"
+            "  python ip2location.py --reverse-country US\n"
+            "  python ip2location.py --reverse-city Tokyo --json\n"
         ),
     )
     parser.add_argument("ips",        nargs="*",  metavar="IP",
@@ -686,6 +822,14 @@ def main():
                         help="Show all databases with download status, then exit.")
     parser.add_argument("--json",     action="store_true",
                         help="Output as JSON. Single IP → object; multiple IPs → array.")
+    parser.add_argument("--reverse-country", metavar="CC",
+                        help="Find CIDR ranges for a country code (e.g. US, DE, JP)."
+                             " Requires DB1CIDR or DB3CIDR to be downloaded.")
+    parser.add_argument("--reverse-city",    metavar="NAME",
+                        help="Find CIDR ranges assigned to a city (substring match)."
+                             " Requires DB3CIDR to be downloaded.")
+    parser.add_argument("--limit",    type=int, default=20, metavar="N",
+                        help="Max results for reverse lookup (default: 20).")
 
     args = parser.parse_args()
 
@@ -714,6 +858,22 @@ def main():
         if not args.ips:
             sys.exit(0 if ok else 1)
         print()
+
+    # ── --reverse-country / --reverse-city ───────────────────────────────────
+    if args.reverse_country or args.reverse_city:
+        rows = reverse_lookup(
+            country_code=args.reverse_country,
+            city=args.reverse_city,
+            limit=args.limit,
+        )
+        if args.json:
+            # Strip internal quote characters that CSV might leave around values.
+            cleaned = [{k: v.strip('"') for k, v in r.items()} for r in rows]
+            print(json.dumps(cleaned, indent=2))
+        else:
+            label = args.reverse_country or f'"{args.reverse_city}"'
+            print_reverse(rows, label)
+        sys.exit(0)
 
     # ── No IPs provided: show help ────────────────────────────────────────────
     if not args.ips:
