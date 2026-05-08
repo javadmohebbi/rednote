@@ -128,6 +128,16 @@ File is valid even if the scan is interrupted mid-way.
 
 ## Reading the output in other tools
 
+### One-liners
+
+```bash
+# Python — print IPs of live hosts
+python3 -c "import json; [print(r['target']) for r in map(json.loads, open('results.jsonl')) if r['status'] == 'up']"
+
+# jq — same thing
+jq -r 'select(.status == "up") | .target' results.jsonl
+```
+
 ### Python
 
 ```python
