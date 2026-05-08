@@ -149,6 +149,43 @@ def check_nmap() -> str:
         sys.exit(f"[ERROR] Cannot run nmap: {exc}")
 
 
+_PERM_KEYWORDS = ("root", "privileges", "administrator", "permission denied",
+                  "operation not permitted", "requires root")
+
+def preflight_check(light: bool):
+    """
+    Before starting the scan, verify we can actually send the required packets.
+    If the default scan needs raw sockets and we don't have them, exit with a
+    clear message rather than silently reporting every host as 'error'.
+    """
+    if light:
+        return   # ICMP + ARP works without root on most systems
+
+    # Quick test: run one SYN probe on localhost and check stderr for denials.
+    try:
+        test = subprocess.run(
+            ["nmap", "-PS80", "-sn", "--host-timeout", "3s", "127.0.0.1"],
+            capture_output=True, timeout=8,
+        )
+        stderr = test.stderr.decode(errors="replace").lower()
+        if any(kw in stderr for kw in _PERM_KEYWORDS):
+            _permission_error_exit()
+    except Exception:
+        pass   # if test itself fails, let the scan proceed and surface the error
+
+
+def _permission_error_exit():
+    print(
+        f"\n{RED}{BOLD}Permission denied{RESET}"
+        f" — the default scan needs raw socket access (TCP SYN/ACK, UDP).\n\n"
+        f"  Fix 1 — run with sudo:  {BOLD}sudo python fastcheck.py ...{RESET}\n"
+        f"  Fix 2 — use light mode: {BOLD}python fastcheck.py ... --light{RESET}\n"
+        f"\n  --light uses ICMP echo + ARP only and does not need root.\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 # Probe flags used by each scan mode.
 # Default (high-accuracy): combines TCP SYN, TCP ACK, UDP, ICMP echo, and
 #   ICMP timestamp probes so that hosts which silently drop one probe type
@@ -192,8 +229,20 @@ def scan_host(target: str, timeout: int, light: bool = False) -> dict:
     probes = PROBES_LIGHT if light else PROBES_DEFAULT
     cmd = ["nmap", "-sn"] + probes + ["-T4", "--host-timeout", f"{timeout}s", "-oX", "-", target]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+        proc   = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+        stderr = proc.stderr.decode(errors="replace")
         _parse_nmap_xml(proc.stdout.decode(errors="replace"), result)
+        # If XML parsing didn't already catch an error, check stderr for
+        # human-readable failure reasons (permissions, interface issues, etc.)
+        if result["status"] in ("error", "unknown") and stderr:
+            stderr_l = stderr.lower()
+            if any(kw in stderr_l for kw in _PERM_KEYWORDS):
+                result["error"] = "needs root/sudo — use --light or run with sudo"
+            else:
+                # Use the first non-empty stderr line as the error detail.
+                first_line = next((l.strip() for l in stderr.splitlines() if l.strip()), "")
+                if first_line:
+                    result["error"] = first_line
     except subprocess.TimeoutExpired:
         result["status"] = "timeout"
     except Exception as exc:
@@ -341,6 +390,8 @@ class LiveDisplay:
 
         lat_s = f"{lat:.2f}ms" if lat is not None else ""
 
+        err = result.get("error", "")
+
         if status == "up":
             st_s  = f"{GREEN}{BOLD}up  {RESET}"
             lat_s = f"{DIM}{lat_s:<10}{RESET}"
@@ -350,6 +401,9 @@ class LiveDisplay:
         elif status == "timeout":
             st_s  = f"{YELLOW}tout{RESET}"
             lat_s = " " * 10
+        elif status == "error":
+            st_s  = f"{RED}err {RESET}"
+            lat_s = f"{RED}{err[:35]}{RESET}" if err else " " * 10
         else:
             st_s  = f"{YELLOW}{status[:4]:<4}{RESET}"
             lat_s = " " * 10
@@ -417,14 +471,16 @@ class SimpleDisplay:
         w      = len(str(self.total))
         lat_s  = f"{lat:.2f}ms" if lat is not None else ""
 
+        err = result.get("error", "")
+
         with self.lock:
             self.done += 1
             s = result.get("status", "other")
             if   s == "up":   self.counts["up"]    += 1
             elif s == "down": self.counts["down"]  += 1
             else:             self.counts["other"] += 1
-            host_s = f"  {host}" if host else ""
-            print(f"[{self.done:{w}}/{self.total}]  {target:<20}  {status:<7}  {lat_s}{host_s}")
+            suffix = f"  {err[:50]}" if s == "error" and err else (f"  {host}" if host else "")
+            print(f"[{self.done:{w}}/{self.total}]  {target:<20}  {status:<7}  {lat_s}{suffix}")
 
     def finish(self):
         pass
@@ -502,6 +558,7 @@ def main():
     args = parser.parse_args()
 
     NMAP_VERSION = check_nmap()
+    preflight_check(args.light)
     targets      = load_targets(args)
     total        = len(targets)
     multi        = total > 1
