@@ -1,1 +1,5 @@
+# local venv
 ./rednote
+
+# output file for local test
+*.jsonl
