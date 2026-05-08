@@ -54,41 +54,55 @@ Scan options:
 Analysis:
   --analyze FILE      Read a .jsonl result file and print a human-readable report
                       Pipe to  | less  or  | less -R  for paging
+  --group-by MODE     How to group the analysis: ip (default) · port · both
 ```
 
 ---
 
 ## Analyzing results
 
-After a scan, use `--analyze` to get a structured human-readable report on screen:
+After a scan, use `--analyze` to get a structured human-readable report on screen.  
+Use `--group-by` to control how results are organised (default: `ip`).
 
 ```bash
+# Group by host/IP (default)
 python scantop100.py --analyze ports.jsonl
+python scantop100.py --analyze ports.jsonl --group-by ip
+
+# Group by port/service — see which hosts share each open port
+python scantop100.py --analyze ports.jsonl --group-by port
+
+# Show both views
+python scantop100.py --analyze ports.jsonl --group-by both
 ```
 
-Pipe to `less` for paging (plain text, no colour codes):
+Pipe to `less` for paging (colours stripped automatically):
 
 ```bash
-python scantop100.py --analyze ports.jsonl | less
-```
-
-Keep colours with `less -R`:
-
-```bash
-python scantop100.py --analyze ports.jsonl | less -R
+python scantop100.py --analyze ports.jsonl --group-by port | less
+python scantop100.py --analyze ports.jsonl --group-by both | less -R
 ```
 
 ### Report layout
+
+Every report starts with a **summary header** (counts, total open ports, top services).  
+The detail section depends on `--group-by`:
+
+| `--group-by` | Detail shown |
+|---|---|
+| `ip` *(default)* | One block per host — its open ports with service and version |
+| `port` | One block per port/service — all hosts that have it open, version per host |
+| `both` | By host first, then by port |
+
+The report always ends with a **footer**: hosts with no open ports and any errors/timeouts.
+
+**`--group-by ip`** (default):
 
 ```
 ══════════════════════════════════════════════════════════════
   ports.jsonl
 ══════════════════════════════════════════════════════════════
-  Hosts scanned    : 5
-  With open ports  : 3
-  No open ports    : 1
-  Errors / timeout : 1
-  Total open ports : 8
+  Hosts scanned    : 5  ·  With open ports: 3  ·  Total open ports: 8
   Top services     : ssh(2)  http(2)  https(2)  mysql(1)
 ══════════════════════════════════════════════════════════════
 
@@ -104,17 +118,32 @@ python scantop100.py --analyze ports.jsonl | less -R
 ──────────────────────────────────────────────────────────────
   22/tcp        ssh              OpenSSH 8.9p1
   3306/tcp      mysql            MySQL 8.0.32
-
-┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-  No open ports (1):
-    10.0.0.9
-
-  Errors / timeout (1):
-    10.0.0.12  (timeout)
 ```
 
-Colours are applied when writing to a terminal and stripped automatically when piped.  
-Hosts are sorted by IP address. The footer lists hosts with no open ports and any errors.
+**`--group-by port`**:
+
+```
+══════════════════════════════════════════════════════════════
+  By port / service
+══════════════════════════════════════════════════════════════
+
+  22/tcp        ssh              (2 hosts)
+      10.0.0.1  router.internal  OpenSSH 9.2p1 Debian 2
+      10.0.0.5  db01.internal    OpenSSH 8.9p1
+
+  80/tcp        http             (1 host)
+      10.0.0.1  router.internal  Apache httpd 2.4.57
+
+  3306/tcp      mysql            (1 host)
+      10.0.0.5  db01.internal    MySQL 8.0.32
+
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+  No open ports (1):  10.0.0.9
+  Errors / timeout (1):  10.0.0.12  (timeout)
+```
+
+Colours are applied on a TTY and stripped automatically when piped.  
+Hosts sort by IP; ports sort by port number. The port grouping collects all hosts on the same port regardless of version — version is shown per host.
 
 ---
 

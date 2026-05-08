@@ -607,14 +607,18 @@ def write_record(fh, record: dict):
 # 7 — Analysis / report
 # ══════════════════════════════════════════════════════════════════════════════
 
-def analyze(path: Path):
+def analyze(path: Path, group_by: str = "ip"):
     """
     Print a human-readable report from a scantop100 .jsonl file.
     Designed to be piped to  | less  or  | less -R  (colours on TTY only).
 
+    group_by  "ip"   — one block per host (default)
+              "port" — one block per port/service listing all hosts
+              "both" — by host first, then by port
+
     Layout
       ─ Summary header: total hosts, open-port count, top services
-      ─ One block per host that has open ports (sorted by IP)
+      ─ Detail section(s) controlled by group_by
       ─ Compact footer: hosts with no open ports / errors
     """
     if not path.exists():
@@ -672,15 +676,16 @@ def analyze(path: Path):
         print("\n  No hosts with open ports found.\n")
         return
 
-    # ── Per-host detail (sorted by IP when possible, else alphabetically) ─────
+    # ── Per-host detail ───────────────────────────────────────────────────────
     def _sort_key(r):
         try:
             return (0, int(ipaddress.ip_address(r.get("target", ""))),)
         except ValueError:
             return (1, r.get("target", ""),)
 
-    print()
-    for r in sorted(with_ports, key=_sort_key):
+    if group_by in ("ip", "both"):
+        print()
+    for r in (sorted(with_ports, key=_sort_key) if group_by in ("ip", "both") else []):
         target   = r.get("target",   "?")
         hostname = r.get("hostname") or ""
         ports    = r.get("ports",    [])
@@ -705,6 +710,55 @@ def analyze(path: Path):
             else:
                 print(f"  {port_s:<12}  {service_s:<15}  {version_s}")
         print()
+
+    # ── Group by port / service ────────────────────────────────────────────────
+    # Build: {(port, protocol, service) → [(target, hostname, version), ...]}
+    # Grouped by port+service so all SSH hosts appear together regardless of version.
+    port_groups: dict = {}
+    for r in records:
+        target   = r.get("target", "?")
+        hostname = r.get("hostname") or ""
+        for p in r.get("ports", []):
+            key = (p["port"], p.get("protocol", "tcp"), p.get("service", ""))
+            port_groups.setdefault(key, []).append((target, hostname, p.get("version", "")))
+
+    if port_groups and group_by in ("port", "both"):
+        print(_c(BOLD + CYAN, wide))
+        print(_c(BOLD, "  By port / service"))
+        print(_c(BOLD + CYAN, wide))
+        print()
+
+        def _ip_key(h):
+            try:
+                return (0, int(ipaddress.ip_address(h[0])))
+            except ValueError:
+                return (1, h[0])
+
+        for (port, proto, service), hosts in sorted(port_groups.items(), key=lambda x: x[0][0]):
+            port_s    = f"{port}/{proto}"
+            n         = len(hosts)
+            host_word = "host" if n == 1 else "hosts"
+
+            if tty:
+                header = (
+                    f"  {_c(GREEN, port_s):<20}"
+                    f"  {_c(CYAN, service):<24}"
+                    f"  {DIM}({n} {host_word}){RESET}"
+                )
+            else:
+                header = f"  {port_s:<12}  {service:<15}  ({n} {host_word})"
+
+            print(header)
+
+            for target, hostname, version in sorted(hosts, key=_ip_key):
+                hn  = f"  {_c(DIM, hostname)}" if hostname else ""
+                ver = f"  {_c(DIM, version)}"  if version  else ""
+                if tty:
+                    print(f"      {_c(YELLOW, target)}{hn}{ver}")
+                else:
+                    suffix = "  ".join(filter(None, [hostname, version]))
+                    print(f"      {target}{('  ' + suffix) if suffix else ''}")
+            print()
 
     # ── Compact footer: hosts without open ports ───────────────────────────────
     if no_ports or errors:
@@ -760,12 +814,15 @@ def main():
     parser.add_argument("--analyze",    metavar="FILE",
                         help="Read a .jsonl result file and print a human-readable "
                              "report. Pipe to  | less  or  | less -R  for paging.")
+    parser.add_argument("--group-by",   metavar="MODE", default="ip",
+                        choices=["ip", "port", "both"],
+                        help="Analysis grouping: ip (default) · port · both.")
 
     args = parser.parse_args()
 
     # ── Analysis mode — read a result file and report, then exit ─────────────
     if args.analyze:
-        analyze(Path(args.analyze))
+        analyze(Path(args.analyze), group_by=args.group_by)
         sys.exit(0)
 
     NMAP_VERSION  = check_nmap()
