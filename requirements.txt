@@ -3,3 +3,6 @@
 
 # reconn/ip2location
 -r reconn/ip2location/requirements.txt
+
+# reconn/fastcheck  (no pip packages; requires nmap system binary)
+-r reconn/fastcheck/requirements.txt

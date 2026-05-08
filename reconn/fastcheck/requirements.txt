@@ -1,0 +1,8 @@
+# fastcheck.py uses only Python standard-library modules.
+# No pip packages are required.
+#
+# System dependency (must be installed separately):
+#   nmap >= 7.0
+#     macOS:   brew install nmap
+#     Debian:  apt install nmap
+#     RHEL:    yum install nmap
