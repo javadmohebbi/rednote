@@ -35,21 +35,136 @@ python http-info.py -f targets.txt --fast -w 20 -o results/
 
 ---
 
-## Prerequisites
+## Installation
+
+No Python packages are required — stdlib only.  
+The tool shells out to external binaries. Install the ones relevant to your OS below.
+
+---
+
+### Kali Linux (recommended)
+
+Everything except `nuclei` is pre-installed on a full Kali image.
 
 ```bash
-# Required
-apt install curl nmap
+# Required (usually already present)
+sudo apt install -y curl nmap
 
-# Optional — pre-installed on Kali
-apt install whatweb wafw00f nikto sslscan gobuster
+# Optional — pre-installed on Kali, install if missing
+sudo apt install -y whatweb wafw00f nikto sslscan gobuster
 
-# Highly recommended — install separately
-apt install nuclei
-# or: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+# Highly recommended — not in default Kali
+sudo apt install -y nuclei
+# or build from source:
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
 
-No Python packages required — stdlib only.
+---
+
+### macOS
+
+Use [Homebrew](https://brew.sh) for most tools. A few require manual steps.
+
+```bash
+# Install Homebrew if not already present
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Required
+brew install curl nmap
+
+# Optional
+brew install whatweb       # or: gem install whatweb
+brew install nikto
+brew install sslscan
+brew install gobuster
+
+# wafw00f — pip only on macOS
+pip3 install wafw00f
+
+# nuclei
+brew install nuclei
+# or:
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+```
+
+> **Note:** Some nmap NSE scripts (especially `vulners`) require the nmap script
+> database to be up to date. Run `sudo nmap --script-updatedb` after installing.
+
+---
+
+### Windows
+
+Running natively on Windows is possible but Kali Linux (WSL2) is strongly recommended
+for a complete toolset. For native Windows use:
+
+**Option A — WSL2 (recommended)**
+
+```powershell
+# Install WSL2 with Kali
+wsl --install -d kali-linux
+
+# Inside the Kali WSL shell, follow the Kali instructions above
+```
+
+**Option B — native Windows**
+
+Install each tool manually:
+
+| Tool | Download |
+|------|---------|
+| **curl** | Built into Windows 10/11 (`curl.exe`) — no install needed |
+| **nmap** | [nmap.org/download](https://nmap.org/download.html) — use the Windows installer |
+| **nikto** | Requires Perl: [strawberryperl.com](https://strawberryperl.com) then `cpan nikto` |
+| **sslscan** | [github.com/rbsec/sslscan/releases](https://github.com/rbsec/sslscan/releases) |
+| **gobuster** | [github.com/OJ/gobuster/releases](https://github.com/OJ/gobuster/releases) |
+| **nuclei** | [github.com/projectdiscovery/nuclei/releases](https://github.com/projectdiscovery/nuclei/releases) |
+| **wafw00f** | `pip install wafw00f` |
+| **whatweb** | Not officially supported on Windows — use WSL2 |
+
+Add each tool's folder to your `PATH` environment variable after installing.
+
+> **PowerShell example** (run as Administrator):
+> ```powershell
+> [System.Environment]::SetEnvironmentVariable(
+>     "Path",
+>     $env:Path + ";C:\Program Files\Nmap",
+>     "Machine"
+> )
+> ```
+
+---
+
+### Verify installation
+
+After installing, run the tool with any target — it checks for required tools at
+startup and warns about missing optional ones:
+
+```bash
+python http-info.py 127.0.0.1 --no-nmap --fast
+```
+
+Expected output if tools are missing:
+
+```
+[WARN] whatweb not found — install with: apt install whatweb
+[WARN] wafw00f not found — install with: apt install wafw00f
+[TIP]  nuclei is not installed but highly recommended: apt install nuclei
+```
+
+---
+
+### Tool summary
+
+| Tool | Required | Kali | macOS | Windows |
+|------|----------|------|-------|---------|
+| `curl` | ✓ | pre-installed | `brew install curl` | built-in |
+| `nmap` | ✓ | pre-installed | `brew install nmap` | installer |
+| `whatweb` | optional | pre-installed | `brew install whatweb` | WSL2 only |
+| `wafw00f` | optional | pre-installed | `pip3 install wafw00f` | `pip install wafw00f` |
+| `nikto` | optional (`--nikto`) | pre-installed | `brew install nikto` | Perl + cpan |
+| `sslscan` | optional | pre-installed | `brew install sslscan` | GitHub release |
+| `gobuster` | optional (`--gobuster`) | pre-installed | `brew install gobuster` | GitHub release |
+| `nuclei` | recommended | `apt install nuclei` | `brew install nuclei` | GitHub release |
 
 ---
 

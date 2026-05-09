@@ -827,10 +827,17 @@ def probe_gobuster(url: str, timeout: int) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scan_one(host: str, port: int, ssl: bool, avail: dict,
-             timeout: int, run_nikto: bool, run_gobuster: bool) -> dict:
+             timeout: int, run_nikto: bool, run_gobuster: bool,
+             progress_cb=None) -> dict:
     """
     Run all enabled probes against one host:port and return a unified result dict.
+    progress_cb(tool_name) is called just before each tool starts so the display
+    can show what is currently running.
     """
+    def _prog(tool):
+        if progress_cb:
+            progress_cb(tool)
+
     t_start = time.monotonic()
     scheme  = "https" if ssl else "http"
     url     = f"{scheme}://{host}:{port}"
@@ -860,6 +867,7 @@ def scan_one(host: str, port: int, ssl: bool, avail: dict,
 
     try:
         # ── curl ──────────────────────────────────────────────────────────────
+        _prog("curl")
         curl_r = probe_curl(host, port, ssl, min(timeout, 15))
         result["tools_used"].append("curl")
         if curl_r.get("error"):
@@ -874,17 +882,20 @@ def scan_one(host: str, port: int, ssl: bool, avail: dict,
 
         # ── whatweb ───────────────────────────────────────────────────────────
         if avail.get("whatweb"):
+            _prog("whatweb")
             techs = probe_whatweb(url, min(timeout, 30))
             result["technologies"] = techs
             result["tools_used"].append("whatweb")
 
         # ── wafw00f ───────────────────────────────────────────────────────────
         if avail.get("wafw00f"):
+            _prog("wafw00f")
             result["waf"] = probe_wafw00f(url, min(timeout, 20))
             result["tools_used"].append("wafw00f")
 
         # ── sslscan ───────────────────────────────────────────────────────────
         if ssl and avail.get("sslscan"):
+            _prog("sslscan")
             result["ssl_info"] = probe_sslscan(host, port, min(timeout, 30))
             result["tools_used"].append("sslscan")
             if result["ssl_info"].get("issues"):
@@ -893,11 +904,11 @@ def scan_one(host: str, port: int, ssl: bool, avail: dict,
 
         # ── nmap HTTP scripts ─────────────────────────────────────────────────
         if avail.get("nmap"):
+            _prog("nmap")
             nmap_r = probe_nmap(host, port, ssl, min(timeout, 60))
             result["tools_used"].append("nmap")
             result["cves"].extend(nmap_r.get("cves", []))
             result["interesting"].extend(nmap_r.get("interesting_paths", []))
-            # Enrich technologies from nmap
             for sid, output in nmap_r.get("scripts", {}).items():
                 if sid == "http-server-header" and output and not result["server"]:
                     result["server"] = output.strip()
@@ -911,6 +922,7 @@ def scan_one(host: str, port: int, ssl: bool, avail: dict,
 
         # ── nikto ─────────────────────────────────────────────────────────────
         if run_nikto and avail.get("nikto"):
+            _prog("nikto")
             nikto_r = probe_nikto(url, timeout)
             result["tools_used"].append("nikto")
             result["cves"].extend(nikto_r.get("cves", []))
@@ -920,6 +932,7 @@ def scan_one(host: str, port: int, ssl: bool, avail: dict,
 
         # ── gobuster ──────────────────────────────────────────────────────────
         if run_gobuster and avail.get("gobuster"):
+            _prog("gobuster")
             paths = probe_gobuster(url, timeout)
             result["tools_used"].append("gobuster")
             for p in paths:
@@ -952,24 +965,54 @@ def scan_one(host: str, port: int, ssl: bool, avail: dict,
 # ══════════════════════════════════════════════════════════════════════════════
 # 9 — Live display
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Layout
+#
+#   Row 1          ─── CYAN bar ───────────────────────────────────────────
+#   Row 2          http-info · nmap X.XX
+#   Row 3          Targets: N  Workers: W  Output: dir
+#   Row 4          ─── CYAN bar ───────────────────────────────────────────
+#   Row 5          Active scans:
+#   Rows 6..5+W    One row per worker — shows current host:port and tool
+#   Row 6+W        ─── DIM thin separator ─────────────────────────────────
+#   Rows 7+W..vend SCROLL REGION — completed results scroll upward
+#   Row vend+1     ─── DIM separator ──────────────────────────────────────
+#   Row vend+2     Done: N/N  CVEs: N  MSF: N  [████░░]  Ctrl+C pause
+#
+# Each worker uses its own fixed row (thread → slot mapping).
+# A background ticker redraws elapsed times every 2 s.
 
 class LiveDisplay:
-    HEADER = 4
-    FOOTER = 3
+    HEADER = 4   # rows 1-4
+    FOOTER = 3   # bottom 3 rows
 
     def __init__(self, total, workers, out_dir, nmap_ver):
         cols, rows  = shutil.get_terminal_size((80, 24))
         self.total   = total
         self.cols    = cols
         self.rows    = rows
-        self.v_start = self.HEADER + 1
-        self.v_end   = max(self.v_start + 2, rows - self.FOOTER)
-        self.f_sep   = self.v_end + 1
-        self.f_stats = self.v_end + 2
-        self.lock    = threading.Lock()
+        self.lock    = threading.RLock()   # RLock: internal methods call each other
         self.done    = 0
         self.counts  = {"ok": 0, "cve": 0, "msf": 0, "err": 0}
         self._paused = False
+        self._stopped = False
+
+        # How many worker rows to show (leave at least 3 scroll rows)
+        self.w_shown = min(workers, max(1, rows - self.HEADER - self.FOOTER - 4))
+
+        # Row numbers (1-indexed)
+        self._r_active_label = self.HEADER + 1                   # "Active scans:"
+        self._r_worker_first = self.HEADER + 2                   # first worker row
+        self._r_worker_last  = self.HEADER + 1 + self.w_shown    # last worker row
+        self._r_worker_sep   = self.HEADER + 2 + self.w_shown    # thin separator
+        self.v_start         = self.HEADER + 3 + self.w_shown    # scroll start
+        self.v_end           = max(self.v_start + 1, rows - self.FOOTER)
+        self.f_sep           = self.v_end + 1
+        self.f_stats         = self.v_end + 2
+
+        # Worker slot state: slot_index → {host, port, tool, t_start}
+        self._slots       = {}   # slot_index → dict
+        self._tid_to_slot = {}   # thread_id  → slot_index
 
         o   = sys.stdout
         bar = "─" * cols
@@ -978,18 +1021,34 @@ class LiveDisplay:
         o.write("\033[?25l")
         o.write("\033[?7l")
 
+        # Header
         self._at(1); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
         self._at(2); o.write(f"{BOLD}  http-info  ·  nmap {nmap_ver}{RESET}")
-        self._at(3)
-        o.write(f"  Targets: {total}  Workers: {workers}  Output: {out_dir}")
+        self._at(3); o.write(f"  Targets: {total}  Workers: {workers}  Output: {out_dir}")
         self._at(4); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
 
-        self._at(self.f_sep); o.write(f"{DIM}{bar}{RESET}")
+        # Active section label
+        self._at(self._r_active_label)
+        o.write(f"  {DIM}Active scans:{RESET}")
+
+        # Empty worker slots
+        for i in range(self.w_shown):
+            self._at(self._r_worker_first + i)
+            o.write(f"  {DIM}w{i:<2}  ─{RESET}")
+
+        # Footer
+        self._at(self._r_worker_sep); o.write(f"{DIM}{bar}{RESET}")
+        self._at(self.f_sep);         o.write(f"{DIM}{bar}{RESET}")
         self._draw_stats()
 
         o.write(f"\033[{self.v_start};{self.v_end}r")
         self._at(self.v_end)
         o.flush()
+
+        # Background ticker — redraws elapsed times every 2 s
+        threading.Thread(target=self._ticker, daemon=True).start()
+
+    # ── Internal helpers (called with lock held) ──────────────────────────────
 
     def _at(self, row, col=1):
         sys.stdout.write(f"\033[{row};{col}H")
@@ -1000,24 +1059,94 @@ class LiveDisplay:
         bw   = max(10, min(24, self.cols - 62))
         fill = int(bw * pct)
         bar  = f"{'█' * fill}{'░' * (bw - fill)}"
-
         self._at(self.f_stats)
         o.write("\033[K")
-        base = (
-            f"  {GREEN}Done: {self.done}/{self.total}{RESET}"
-            f"  {RED}CVEs: {self.counts['cve']}{RESET}"
-            f"  {YELLOW}MSF: {self.counts['msf']}{RESET}"
-            f"  {CYAN}[{bar}]{RESET}"
-            f"  {DIM}Ctrl+C pause{RESET}"
-        )
         if self._paused:
-            base = (
+            o.write(
                 f"  {GREEN}Done: {self.done}/{self.total}{RESET}"
                 f"  {RED}CVEs: {self.counts['cve']}{RESET}"
                 f"  {YELLOW}MSF: {self.counts['msf']}{RESET}"
                 f"  {YELLOW}{BOLD}⏸ PAUSED{RESET}  ↵ resume  ·  Ctrl+C quit"
             )
-        o.write(base)
+        else:
+            o.write(
+                f"  {GREEN}Done: {self.done}/{self.total}{RESET}"
+                f"  {RED}CVEs: {self.counts['cve']}{RESET}"
+                f"  {YELLOW}MSF: {self.counts['msf']}{RESET}"
+                f"  {CYAN}[{bar}]{RESET}"
+                f"  {DIM}Ctrl+C pause{RESET}"
+            )
+
+    def _redraw_slot(self, idx: int):
+        """Redraw one worker row (call with lock held)."""
+        row = self._r_worker_first + idx
+        if row > self._r_worker_last:
+            return
+        o = sys.stdout
+        self._at(row, 1)
+        o.write("\033[K")
+        slot = self._slots.get(idx)
+        if slot:
+            elapsed = int(time.monotonic() - slot["t"])
+            tool    = slot.get("tool", "…")
+            target  = f"{slot['host']}:{slot['port']}"
+            o.write(
+                f"  {CYAN}w{idx:<2}{RESET}  "
+                f"{YELLOW}{target:<22}{RESET}  "
+                f"{DIM}→ {tool:<12}  {elapsed}s{RESET}"
+            )
+        else:
+            o.write(f"  {DIM}w{idx:<2}  ─{RESET}")
+
+    def _ticker(self):
+        """Background thread: refresh elapsed times every 2 s."""
+        while not self._stopped:
+            time.sleep(2)
+            with self.lock:
+                if self._stopped:
+                    break
+                for idx in list(self._slots):
+                    self._redraw_slot(idx)
+                self._at(self.v_end)
+                sys.stdout.flush()
+
+    # ── Public slot API ───────────────────────────────────────────────────────
+
+    def claim_slot(self, host: str, port: int):
+        """Called at the start of each worker task."""
+        tid = threading.get_ident()
+        with self.lock:
+            used = set(self._slots)
+            idx  = next((i for i in range(self.w_shown) if i not in used), 0)
+            self._slots[idx]      = {"host": host, "port": port, "tool": "…", "t": time.monotonic()}
+            self._tid_to_slot[tid] = idx
+            self._redraw_slot(idx)
+            self._at(self.v_end)
+            sys.stdout.flush()
+
+    def update_slot(self, tool: str):
+        """Called just before each tool runs."""
+        tid = threading.get_ident()
+        with self.lock:
+            idx = self._tid_to_slot.get(tid)
+            if idx is not None and idx in self._slots:
+                self._slots[idx]["tool"] = tool
+                self._redraw_slot(idx)
+                self._at(self.v_end)
+                sys.stdout.flush()
+
+    def release_slot(self):
+        """Called after the worker task finishes."""
+        tid = threading.get_ident()
+        with self.lock:
+            idx = self._tid_to_slot.pop(tid, None)
+            if idx is not None:
+                self._slots.pop(idx, None)
+                self._redraw_slot(idx)
+                self._at(self.v_end)
+                sys.stdout.flush()
+
+    # ── Public display API ────────────────────────────────────────────────────
 
     def set_paused(self, paused: bool):
         with self.lock:
@@ -1027,38 +1156,37 @@ class LiveDisplay:
             sys.stdout.flush()
 
     def add_result(self, result: dict):
-        target   = result.get("target", "?")
-        port     = result.get("port", 0)
-        status   = result.get("status", "?")
-        title    = result.get("title", "")[:25]
-        server   = result.get("server", "")[:20]
-        techs    = result.get("technologies", [])
-        cves     = result.get("cves", [])
-        msf      = result.get("msf_modules", [])
-        w        = len(str(self.total))
+        target = result.get("target", "?")
+        port   = result.get("port", 0)
+        status = result.get("status", "?")
+        server = result.get("server", "")[:22]
+        techs  = result.get("technologies", [])
+        cves   = result.get("cves", [])
+        msf    = result.get("msf_modules", [])
+        w      = len(str(self.total))
 
         tech_s = " ".join(
             f"{t['name']}{(' ' + t['version']) if t.get('version') else ''}"
             for t in techs[:3]
-        )[:30]
+        )[:28]
 
         if status == "ok":
             st_s   = f"{GREEN}ok  {RESET}"
-            info_s = f"{DIM}{server or tech_s or title}{RESET}"
+            info_s = f"{DIM}{server or tech_s}{RESET}"
         elif status in ("timeout", "refused", "connection refused"):
             st_s   = f"{YELLOW}tout{RESET}"
             info_s = ""
         else:
             st_s   = f"{RED}err {RESET}"
-            info_s = f"{RED}{status[:20]}{RESET}"
+            info_s = f"{RED}{status[:22]}{RESET}"
 
-        cve_s = f"  {RED}{len(cves)} CVE{'s' if len(cves)!=1 else ''}{RESET}" if cves else ""
-        msf_s = f"  {YELLOW}→{len(msf)} MSF{RESET}"                           if msf  else ""
+        cve_s = f"  {RED}{len(cves)}▲{RESET}"   if cves else ""
+        msf_s = f"  {YELLOW}→{len(msf)}⚡{RESET}" if msf  else ""
 
         with self.lock:
             self.done += 1
-            if status == "ok":       self.counts["ok"]  += 1
-            elif status == "error":  self.counts["err"] += 1
+            if status == "ok":      self.counts["ok"]  += 1
+            elif status == "error": self.counts["err"] += 1
             self.counts["cve"] += len(cves)
             self.counts["msf"] += len(msf)
 
@@ -1075,6 +1203,7 @@ class LiveDisplay:
             o.flush()
 
     def finish(self):
+        self._stopped = True
         with self.lock:
             o = sys.stdout
             o.write("\033[r")
@@ -1086,6 +1215,8 @@ class LiveDisplay:
 
 
 class SimpleDisplay:
+    """Fallback for non-TTY — plain line-by-line output."""
+
     def __init__(self, total, workers, out_dir, nmap_ver):
         self.total  = total
         self.lock   = threading.Lock()
@@ -1095,12 +1226,22 @@ class SimpleDisplay:
         print(f"\n{bar}")
         print(f"  http-info  ·  nmap {nmap_ver}")
         print(f"  Targets: {total}  Workers: {workers}  Output: {out_dir}")
-        print(f"{bar}\n")
-        print("  Ctrl+C to pause  ·  Enter to resume  ·  Ctrl+C again to quit\n")
+        print(f"{bar}")
+        print("  Ctrl+C pause  ·  Enter resume  ·  Ctrl+C quit\n")
 
     def set_paused(self, paused: bool):
         if paused:
             print("[PAUSED]  Press Enter to resume or Ctrl+C to quit...")
+
+    def claim_slot(self, host: str, port: int):
+        with self.lock:
+            print(f"  → {host}:{port}  starting…")
+
+    def update_slot(self, tool: str):
+        pass   # too noisy on plain text
+
+    def release_slot(self):
+        pass
 
     def add_result(self, result: dict):
         target = result.get("target", "?")
@@ -1158,7 +1299,275 @@ def write_result(out_dir: Path, result: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 11 — CLI
+# 11 — Analysis / report
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_dir(path: Path, group_by: str = "host"):
+    """
+    Read all per-host JSON files from an output directory and print a report.
+    Designed for  | less  or  | less -R  (colours on TTY, plain text when piped).
+
+    group_by  host     — per-host summary with ports, CVEs, MSF (default)
+              port     — all hosts grouped by port number
+              cve      — all affected hosts grouped by CVE ID
+              service  — all hosts grouped by detected technology
+              msf      — all applicable hosts grouped by MSF module
+              headers  — security header gaps across all hosts
+              all      — all of the above in sequence
+    """
+    if not path.exists():
+        sys.exit(f"[ERROR] Directory not found: {path}")
+
+    records = []
+    for f in sorted(path.glob("*.json")):
+        if f.name.startswith("_"):
+            continue
+        try:
+            records.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    if not records:
+        sys.exit(f"[ERROR] No result files found in {path}")
+
+    tty  = sys.stdout.isatty()
+    def _c(code, text): return f"{code}{text}{RESET}" if tty else str(text)
+
+    wide  = "═" * 64
+    thin  = "─" * 64
+    dthin = "┄" * 64
+
+    # ── Shared sort key ───────────────────────────────────────────────────────
+    def _ip_sort(r):
+        try:
+            return (0, int(ipaddress.ip_address(r.get("target", ""))), r.get("port", 0))
+        except ValueError:
+            return (1, r.get("target", ""), r.get("port", 0))
+
+    # ── Summary header ────────────────────────────────────────────────────────
+    total_cves = sum(len(r.get("cves", [])) for r in records)
+    total_msf  = sum(len(r.get("msf_modules", [])) for r in records)
+    with_cves  = [r for r in records if r.get("cves")]
+    with_msf   = [r for r in records if r.get("msf_modules")]
+    ok_hosts   = [r for r in records if r.get("status") == "ok"]
+    errors     = [r for r in records if r.get("status") not in ("ok",)]
+
+    all_svcs : dict = {}
+    for r in records:
+        for t in r.get("technologies", []):
+            n = t.get("name", "")
+            if n:
+                all_svcs[n] = all_svcs.get(n, 0) + 1
+    top_svcs = sorted(all_svcs.items(), key=lambda x: -x[1])[:6]
+
+    print()
+    print(_c(BOLD + CYAN, wide))
+    print(_c(BOLD,         f"  {path}"))
+    print(_c(BOLD + CYAN, wide))
+    print(f"  Scanned          : {len(records)}  ({len(ok_hosts)} ok,  {len(errors)} errors)")
+    print(f"  With CVEs        : {_c(RED,    len(with_cves))}  ({total_cves} total)")
+    print(f"  With MSF modules : {_c(YELLOW, len(with_msf))}  ({total_msf} total)")
+    if top_svcs:
+        svc_s = "  ".join(f"{s}({n})" for s, n in top_svcs)
+        print(f"  Top technologies : {_c(CYAN, svc_s)}")
+    print(_c(BOLD + CYAN, wide))
+    print()
+
+    views = [group_by] if group_by != "all" else ["host","port","cve","service","msf","headers"]
+
+    for view in views:
+
+        # ── By host ───────────────────────────────────────────────────────────
+        if view == "host":
+            print(_c(BOLD, f"  ▶ By host"))
+            print(_c(DIM, thin))
+            for r in sorted(records, key=_ip_sort):
+                target = r.get("target", "?")
+                port   = r.get("port", 0)
+                url    = r.get("url", f"{target}:{port}")
+                server = r.get("server", "")
+                techs  = [t["name"] + (" " + t.get("version","") if t.get("version") else "")
+                          for t in r.get("technologies", [])]
+                cves   = r.get("cves", [])
+                msf    = r.get("msf_modules", [])
+                status = r.get("status", "?")
+                dur    = r.get("scan_duration_s")
+                waf    = r.get("waf", {})
+
+                # Host line
+                st_c  = GREEN if status == "ok" else RED
+                dur_s = f"  {DIM}({dur:.0f}s){RESET}" if tty and dur else (f"  ({dur:.0f}s)" if dur else "")
+                waf_s = f"  {YELLOW}[WAF: {waf['name']}]{RESET}" if waf.get("detected") else ""
+                print(_c(BOLD, f"  {url}") + dur_s + waf_s)
+
+                if server:
+                    print(f"    {_c(DIM, 'Server:'):<18}  {_c(CYAN, server)}")
+                if techs:
+                    print(f"    {_c(DIM, 'Technologies:'):<18}  {', '.join(techs[:6])}")
+                if cves:
+                    top = cves[:5]
+                    cve_s = "  ".join(
+                        f"{_c(RED, c['id'])} ({c.get('score',0):.1f})" for c in top
+                    )
+                    more  = f"  {DIM}+{len(cves)-5} more{RESET}" if len(cves) > 5 else ""
+                    print(f"    {_c(DIM, 'CVEs:'):<18}  {cve_s}{more}")
+                if msf:
+                    for m in msf[:3]:
+                        print(f"    {_c(YELLOW, '→ ' + m['module'])}")
+                print()
+
+        # ── By port ───────────────────────────────────────────────────────────
+        elif view == "port":
+            port_map: dict = {}
+            for r in records:
+                port_map.setdefault(r.get("port", 0), []).append(r)
+
+            print(_c(BOLD, "  ▶ By port"))
+            print(_c(DIM, thin))
+            for port in sorted(port_map):
+                hosts = port_map[port]
+                n     = len(hosts)
+                print(_c(BOLD, f"  Port {port}  ")
+                      + _c(DIM, f"({n} host{'s' if n!=1 else ''})"))
+                for r in sorted(hosts, key=_ip_sort):
+                    target = r.get("target", "?")
+                    server = r.get("server", "")
+                    cves   = r.get("cves", [])
+                    hn     = r.get("title", "")[:30]
+                    cve_s  = f"  {_c(RED, str(len(cves)) + ' CVE')}" if cves else ""
+                    info   = server or hn
+                    print(f"    {_c(CYAN, target):<24}  {_c(DIM, info)}{cve_s}")
+                print()
+
+        # ── By CVE ────────────────────────────────────────────────────────────
+        elif view == "cve":
+            cve_map: dict = {}
+            for r in records:
+                for c in r.get("cves", []):
+                    cve_map.setdefault(c["id"], {"score": c.get("score",0), "hosts": []})["hosts"].append(r)
+
+            if not cve_map:
+                print(_c(DIM, "  ▶ By CVE — no CVEs found\n"))
+            else:
+                print(_c(BOLD, "  ▶ By CVE  ") + _c(DIM, f"({len(cve_map)} unique CVEs)"))
+                print(_c(DIM, thin))
+                for cve_id, data in sorted(cve_map.items(), key=lambda x: -x[1]["score"]):
+                    hosts = data["hosts"]
+                    score = data["score"]
+                    score_col = RED if score >= 7 else YELLOW if score >= 4 else DIM
+                    print(
+                        _c(BOLD, f"  {cve_id}")
+                        + f"  {_c(score_col, f'CVSS {score:.1f}')}"
+                        + _c(DIM, f"  ({len(hosts)} host{'s' if len(hosts)!=1 else ''})")
+                    )
+                    for r in sorted(hosts, key=_ip_sort):
+                        url = r.get("url", r.get("target"))
+                        print(f"    {_c(CYAN, url)}")
+                    print()
+
+        # ── By service / technology ───────────────────────────────────────────
+        elif view == "service":
+            svc_map: dict = {}
+            for r in records:
+                seen = set()
+                for t in r.get("technologies", []):
+                    name = t.get("name", "")
+                    if name and name not in seen:
+                        seen.add(name)
+                        svc_map.setdefault(name, []).append(
+                            (r, t.get("version", ""))
+                        )
+
+            if not svc_map:
+                print(_c(DIM, "  ▶ By service — no technologies detected\n"))
+            else:
+                print(_c(BOLD, "  ▶ By service / technology"))
+                print(_c(DIM, thin))
+                for name, entries in sorted(svc_map.items(), key=lambda x: -len(x[1])):
+                    n = len(entries)
+                    print(_c(BOLD, f"  {name}  ") + _c(DIM, f"({n} host{'s' if n!=1 else ''})"))
+                    for r, ver in sorted(entries, key=lambda e: _ip_sort(e[0])):
+                        url   = r.get("url", r.get("target"))
+                        cves  = r.get("cves", [])
+                        ver_s = f"  {DIM}{ver}{RESET}" if ver else ""
+                        cve_s = f"  {_c(RED, str(len(cves)) + ' CVE')}" if cves else ""
+                        print(f"    {_c(CYAN, url)}{ver_s}{cve_s}")
+                    print()
+
+        # ── By MSF module ─────────────────────────────────────────────────────
+        elif view == "msf":
+            msf_map: dict = {}
+            for r in records:
+                for m in r.get("msf_modules", []):
+                    mod = m["module"]
+                    msf_map.setdefault(mod, {"desc": m.get("description",""), "reason": m.get("reason",""), "hosts": []})["hosts"].append(r)
+
+            if not msf_map:
+                print(_c(DIM, "  ▶ By MSF module — no modules suggested\n"))
+            else:
+                print(_c(BOLD, "  ▶ By Metasploit module"))
+                print(_c(DIM, thin))
+                for mod, data in sorted(msf_map.items(), key=lambda x: -len(x[1]["hosts"])):
+                    hosts = data["hosts"]
+                    print(
+                        _c(YELLOW, f"  {mod}")
+                        + _c(DIM, f"  ({len(hosts)} host{'s' if len(hosts)!=1 else ''})")
+                    )
+                    if data["desc"]:
+                        print(f"    {_c(DIM, data['desc'])}  {_c(DIM, data['reason'])}")
+                    for r in sorted(hosts, key=_ip_sort):
+                        url = r.get("url", r.get("target"))
+                        print(f"    {_c(CYAN, url)}")
+                    print()
+
+        # ── Security headers ──────────────────────────────────────────────────
+        elif view == "headers":
+            SECURITY_HEADERS = [
+                ("strict-transport-security", "HSTS",              True),  # True = HTTPS only
+                ("content-security-policy",   "CSP",               False),
+                ("x-frame-options",           "X-Frame-Options",   False),
+                ("x-content-type-options",    "X-Content-Type",    False),
+                ("permissions-policy",        "Permissions-Policy",False),
+                ("referrer-policy",           "Referrer-Policy",   False),
+                ("x-xss-protection",          "X-XSS-Protection",  False),
+            ]
+
+            print(_c(BOLD, "  ▶ Security header gaps"))
+            print(_c(DIM, thin))
+
+            https_hosts = [r for r in records if r.get("ssl")]
+            all_ok = [r for r in records if r.get("status") == "ok"]
+
+            for header, label, https_only in SECURITY_HEADERS:
+                pool = https_hosts if https_only else all_ok
+                missing = [r for r in pool
+                           if header not in {k.lower() for k in r.get("headers", {})}]
+                if not missing:
+                    print(f"  {_c(GREEN, '✓')}  {label:<28}  present on all hosts")
+                else:
+                    pct = int(100 * len(missing) / len(pool)) if pool else 0
+                    print(
+                        f"  {_c(RED, '✗')}  {label:<28}  "
+                        f"{_c(RED, f'missing on {len(missing)}/{len(pool)} hosts ({pct}%)')}"
+                    )
+                    for r in sorted(missing, key=_ip_sort)[:8]:
+                        print(f"       {_c(DIM, r.get('url', r.get('target')))}")
+                    if len(missing) > 8:
+                        print(f"       {_c(DIM, f'... and {len(missing)-8} more')}")
+            print()
+
+        # ── Footer ────────────────────────────────────────────────────────────
+    if errors:
+        print(_c(DIM, dthin))
+        print(_c(DIM, f"  Errors / not reachable ({len(errors)}):"))
+        for r in sorted(errors, key=_ip_sort):
+            st = r.get("status", "?")
+            print(_c(DIM, f"    {r.get('url', r.get('target'))}  ({st})"))
+        print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12 — CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -1195,8 +1604,18 @@ def main():
                         help="Skip nmap HTTP/SSL scripts")
     parser.add_argument("--fast",       action="store_true",
                         help="Quick mode: curl + whatweb only (~10s per host)")
+    parser.add_argument("--analyze",    metavar="DIR",
+                        help="Analyze an existing results directory instead of scanning.")
+    parser.add_argument("--group-by",   metavar="MODE", default="host",
+                        choices=["host","port","cve","service","msf","headers","all"],
+                        help="Analysis grouping: host(default) port cve service msf headers all")
 
     args = parser.parse_args()
+
+    # ── Analysis mode ─────────────────────────────────────────────────────────
+    if args.analyze:
+        analyze_dir(Path(args.analyze), group_by=args.group_by)
+        sys.exit(0)
 
     avail = check_tools()
 
@@ -1241,9 +1660,14 @@ def main():
             return
         if _quit_event.is_set():
             return
-        result        = scan_one(host, port, ssl, avail, args.timeout,
-                                 args.nikto, args.gobuster)
-        result["input"] = source
+        display.claim_slot(host, port)
+        try:
+            result = scan_one(host, port, ssl, avail, args.timeout,
+                              args.nikto, args.gobuster,
+                              progress_cb=display.update_slot)
+            result["input"] = source
+        finally:
+            display.release_slot()
         display.add_result(result)
         write_result(out_dir, result)
 
