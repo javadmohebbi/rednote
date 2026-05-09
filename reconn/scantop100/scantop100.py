@@ -189,8 +189,10 @@ def _count_spec(spec: str) -> int:
 
 def _iter_file(path: Path):
     """
-    Yield (host, source_spec) pairs from a target file (lazy).
+    Yield (host, source_spec, input_hostname) triples from a target file (lazy).
     Auto-detects fastcheck .jsonl and extracts only 'up' hosts.
+    The input_hostname is the PTR/reverse-DNS name fastcheck discovered — preserved
+    so downstream results stay traceable to the original domain name.
     Plain text: one target per line, # = comment.
     """
     if _is_fastcheck_jsonl(path):
@@ -199,7 +201,7 @@ def _iter_file(path: Path):
                 try:
                     r = json.loads(line)
                     if r.get("status") == "up" and r.get("target"):
-                        yield r["target"], str(path)
+                        yield r["target"], str(path), r.get("hostname") or ""
                 except json.JSONDecodeError:
                     pass
     else:
@@ -209,7 +211,7 @@ def _iter_file(path: Path):
                 if not line or line.startswith("#"):
                     continue
                 for host in expand_target(line):
-                    yield host, line
+                    yield host, line, ""
 
 
 def _count_file(path: Path) -> int:
@@ -247,7 +249,7 @@ def resolve_targets(args):
 
     if args.target:
         hosts = list(expand_target(args.target))
-        return len(hosts), lambda: ((h, args.target) for h in expand_target(args.target))
+        return len(hosts), lambda: ((h, args.target, "") for h in expand_target(args.target))
 
     sys.exit("[ERROR] Provide a TARGET or use -f FILE.")
 
@@ -855,13 +857,14 @@ def main():
     # ── File (append on resume, fresh write otherwise) ────────────────────────
     fh = open(out_path, "a" if completed else "w", encoding="utf-8") if out_path else None
 
-    def run_one(host: str, input_spec: str):
+    def run_one(host: str, input_spec: str, input_hostname: str):
         if not wait_if_paused(display):
             return
         if _quit_event.is_set():
             return
-        result          = scan_target(host, args.timeout)
-        result["input"] = input_spec
+        result                   = scan_target(host, args.timeout)
+        result["input"]          = input_spec
+        result["input_hostname"] = input_hostname   # PTR from fastcheck, if any
         display.add_result(result)
         if fh and (not args.open_only or result.get("open_ports")):
             write_record(fh, result)
@@ -871,17 +874,17 @@ def main():
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            gen     = ((h, inp) for h, inp in gen_fn() if h not in completed)
+            gen     = ((h, inp, hn) for h, inp, hn in gen_fn() if h not in completed)
             pending = set()
-            for host, inp in itertools.islice(gen, MAX_PENDING):
-                pending.add(pool.submit(run_one, host, inp))
+            for host, inp, hn in itertools.islice(gen, MAX_PENDING):
+                pending.add(pool.submit(run_one, host, inp, hn))
             while pending and not _quit_event.is_set():
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for f in done:
                     f.result()
                 if not _quit_event.is_set():
-                    for host, inp in itertools.islice(gen, len(done)):
-                        pending.add(pool.submit(run_one, host, inp))
+                    for host, inp, hn in itertools.islice(gen, len(done)):
+                        pending.add(pool.submit(run_one, host, inp, hn))
     except Exception:
         pass
     finally:

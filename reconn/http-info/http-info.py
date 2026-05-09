@@ -392,9 +392,13 @@ def parse_target_spec(spec: str, default_ports: list) -> list:
 
 
 def _iter_file(path: Path, default_ports: list):
-    """Yield (host, port, ssl, source) tuples from a target file (lazy)."""
+    """
+    Yield (host, port, ssl, source, input_hostname) tuples from a target file (lazy).
+    input_hostname is the PTR/reverse-DNS name the upstream tool (fastcheck or
+    scantop100) already discovered — carried forward so every result stays
+    traceable to the original domain name even when stored by raw IP.
+    """
     if _is_scantop100_jsonl(path):
-        # scantop100 output — extract HTTP ports from scan results
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
@@ -402,35 +406,35 @@ def _iter_file(path: Path, default_ports: list):
                     if r.get("host_status") not in ("up", "unknown"):
                         continue
                     target = r.get("target", "")
+                    hn     = r.get("input_hostname") or r.get("hostname") or ""
                     for p in r.get("ports", []):
                         if service_is_http(p):
                             ssl = port_is_ssl(p["port"], p.get("service", ""))
-                            yield target, p["port"], ssl, str(path)
+                            yield target, p["port"], ssl, str(path), hn
                 except json.JSONDecodeError:
                     pass
 
     elif _is_fastcheck_jsonl(path):
-        # fastcheck output — up hosts only, use default ports
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
                     r = json.loads(line)
                     if r.get("status") == "up" and r.get("target"):
+                        hn = r.get("hostname") or ""
                         for port in default_ports:
                             ssl = port_is_ssl(port)
-                            yield r["target"], port, ssl, str(path)
+                            yield r["target"], port, ssl, str(path), hn
                 except json.JSONDecodeError:
                     pass
 
     else:
-        # Plain text — one target spec per line
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
                 for host, port, ssl in parse_target_spec(line, default_ports):
-                    yield host, port, ssl, line
+                    yield host, port, ssl, line, ""
 
 
 def _count_file(path: Path, default_ports: list) -> int:
@@ -453,7 +457,7 @@ def resolve_targets(args):
         entries = parse_target_spec(args.target, dp)
         if not entries:
             sys.exit(f"[ERROR] Could not parse target: {args.target}")
-        return len(entries), lambda: ((h, p, s, args.target) for h, p, s in entries)
+        return len(entries), lambda: ((h, p, s, args.target, "") for h, p, s in entries)
 
     sys.exit("[ERROR] Provide a TARGET or use -f FILE.")
 
@@ -1279,18 +1283,19 @@ def write_result(out_dir: Path, result: dict):
 
     # Append a compact summary line
     summary_fields = {
-        "timestamp":    result["timestamp"],
-        "target":       result["target"],
-        "port":         result["port"],
-        "url":          result["url"],
-        "status":       result["status"],
-        "http_status":  result["http_status"],
-        "title":        result["title"],
-        "server":       result["server"],
-        "technologies": [t["name"] for t in result.get("technologies", [])],
-        "cve_count":    len(result.get("cves", [])),
-        "msf_count":    len(result.get("msf_modules", [])),
-        "waf":          result.get("waf", {}).get("name"),
+        "timestamp":      result["timestamp"],
+        "target":         result["target"],
+        "input_hostname": result.get("input_hostname") or "",
+        "port":           result["port"],
+        "url":            result["url"],
+        "status":         result["status"],
+        "http_status":    result["http_status"],
+        "title":          result["title"],
+        "server":         result["server"],
+        "technologies":   [t["name"] for t in result.get("technologies", [])],
+        "cve_count":      len(result.get("cves", [])),
+        "msf_count":      len(result.get("msf_modules", [])),
+        "waf":            result.get("waf", {}).get("name"),
     }
     summary_path = out_dir / "_summary.jsonl"
     with _summ_lock:
@@ -1655,7 +1660,7 @@ def main():
     Display = LiveDisplay if sys.stdout.isatty() else SimpleDisplay
     display = Display(remaining or total, args.workers, out_dir, nmap_ver)
 
-    def run_one(host: str, port: int, ssl: bool, source: str):
+    def run_one(host: str, port: int, ssl: bool, source: str, input_hostname: str):
         if not wait_if_paused(display):
             return
         if _quit_event.is_set():
@@ -1665,7 +1670,8 @@ def main():
             result = scan_one(host, port, ssl, avail, args.timeout,
                               args.nikto, args.gobuster,
                               progress_cb=display.update_slot)
-            result["input"] = source
+            result["input"]          = source
+            result["input_hostname"] = input_hostname   # PTR from upstream tool
         finally:
             display.release_slot()
         display.add_result(result)
@@ -1676,21 +1682,21 @@ def main():
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             gen     = (
-                (h, p, s, src)
-                for h, p, s, src in gen_fn()
+                (h, p, s, src, hn)
+                for h, p, s, src, hn in gen_fn()
                 if (h, p) not in completed
             )
             pending = set()
-            for h, p, s, src in itertools.islice(gen, MAX_PENDING):
-                pending.add(pool.submit(run_one, h, p, s, src))
+            for h, p, s, src, hn in itertools.islice(gen, MAX_PENDING):
+                pending.add(pool.submit(run_one, h, p, s, src, hn))
 
             while pending and not _quit_event.is_set():
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for f in done:
                     f.result()
                 if not _quit_event.is_set():
-                    for h, p, s, src in itertools.islice(gen, len(done)):
-                        pending.add(pool.submit(run_one, h, p, s, src))
+                    for h, p, s, src, hn in itertools.islice(gen, len(done)):
+                        pending.add(pool.submit(run_one, h, p, s, src, hn))
 
     except Exception:
         pass
