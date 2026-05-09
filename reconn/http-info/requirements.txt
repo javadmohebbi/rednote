@@ -1,0 +1,19 @@
+# http-info.py uses only Python standard-library modules.
+# No pip packages required.
+#
+# System tools (Kali Linux pre-installed unless noted):
+#
+#   REQUIRED
+#     curl      apt install curl
+#     nmap      apt install nmap
+#
+#   OPTIONAL — installed on Kali by default
+#     whatweb   apt install whatweb
+#     wafw00f   apt install wafw00f
+#     nikto     apt install nikto          (opt-in: --nikto)
+#     sslscan   apt install sslscan
+#     gobuster  apt install gobuster       (opt-in: --gobuster)
+#
+#   RECOMMENDED — not in default Kali, install separately
+#     nuclei    apt install nuclei
+#                  or: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
