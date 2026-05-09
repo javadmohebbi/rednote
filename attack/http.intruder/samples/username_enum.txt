@@ -1,0 +1,9 @@
+POST /forgot-password HTTP/1.1
+Host: target.com
+Content-Type: application/json
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0
+Accept: application/json
+X-Requested-With: XMLHttpRequest
+Connection: close
+
+{"username": "$$$_USER_$$$"}

