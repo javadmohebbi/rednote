@@ -9,13 +9,17 @@ Full pause, resume, and stop-condition support.
 ## Quick start
 
 ```bash
-# 1. Copy the example request (captured from Burp / browser devtools)
-cp example_request.txt my_request.txt
+# 1. Copy a sample config and request from the samples/ folder
+cp samples/login_bruteforce.txt     my_request.txt
+cp samples/login_bruteforce_config.json config.json
 
-# 2. Edit the config
-cp example_config.json config.json
+# 2. Edit config.json — set "target", "request", and payload file paths
+#    The "request" field must point to your request file (relative to config)
 
-# 3. Run
+# 3. Test first — sends ONE request and prints the full response
+python http.intruder.py config.json --test
+
+# 4. Run the full attack
 python http.intruder.py config.json
 
 # Start fresh (ignore previous run)
@@ -154,6 +158,110 @@ A response is flagged as a **match** if any of these conditions is true:
 | `save_matches_only` | false | Only write matches to the output file |
 | `save_response_body` | false | Include full response body in output for matches |
 | `output` | auto-generated | Output `.jsonl` filename |
+| `test_value` | `"TEST"` | Default substitution value used by `--test` when a payload's `test_value` is not set |
+| `save_response_body` | false | Store full response body in output for matched requests |
+
+Per-payload `test_value`: set `"test_value": "admin"` inside a payload spec to use a meaningful value during `--test` instead of the first dictionary entry.
+
+---
+
+## Test run (`--test`)
+
+Before launching a full attack (which may send millions of requests), always verify your setup first:
+
+```bash
+python http.intruder.py config.json --test
+```
+
+The tool will:
+1. Replace each placeholder with the payload's `test_value` (or the first entry from the wordlist/generator)
+2. Print the fully-substituted request
+3. Send it and print the complete response — status, headers, body preview
+4. Evaluate whether the response would be flagged as a **match** under your config
+
+Example output:
+
+```
+════════════════════════════════════════════════════════════════
+  http.intruder  ·  TEST RUN
+════════════════════════════════════════════════════════════════
+
+  Placeholders:
+    $$$_USER_$$$  →  admin
+    $$$_PASS_$$$  →  password
+
+  Request:
+────────────────────────────────────────────────────────────────
+  POST https://target.com/login
+  Host: target.com
+  Content-Type: application/x-www-form-urlencoded
+  Content-Length: 31
+
+  username=admin&password=password
+────────────────────────────────────────────────────────────────
+
+  Response:
+────────────────────────────────────────────────────────────────
+  Status : 200   Length: 4832 bytes   Time: 43 ms
+
+  content-type: text/html; charset=utf-8
+  set-cookie: session=xyz; HttpOnly
+  ...
+
+  <html><body><p>Invalid username or password.</p>...
+────────────────────────────────────────────────────────────────
+
+  Match criteria : no match (expected for a test with non-payload values)
+
+  Test complete. No output file written.
+```
+
+**What to check:**
+- Status code is what you expect (200 for login forms, even on failure)
+- Response body shows the "bad credentials" message — confirms the endpoint is right
+- `Content-Length` was updated correctly after substitution
+- If you see a connection error, check `target`, SSL settings, and the `Host` header
+
+**Finding the baseline length** (for username enumeration):
+
+```bash
+# 1. Run test with an invalid username
+python http.intruder.py config.json --test
+# Note the response length, e.g. 4832
+
+# 2. Set length_not_equals in the config
+"match": { "length_not_equals": 4832 }
+
+# 3. Run the attack — only valid usernames will be flagged
+```
+
+---
+
+## Sample requests (`samples/`)
+
+Three ready-to-use examples in the `samples/` folder:
+
+| Files | Attack type | Description |
+|---|---|---|
+| `login_bruteforce.txt` + `login_bruteforce_config.json` | Cluster bomb | POST login form — try every user × every password |
+| `username_enum.txt` + `username_enum_config.json` | Battering ram | Username enumeration via forgot-password response differences |
+| `api_auth_fuzz.txt` + `api_auth_fuzz_config.json` | Pitchfork | API IDOR check — user IDs paired with known tokens |
+
+### How to use a sample
+
+```bash
+cd samples/
+
+# 1. Edit the config — change target, request path, and payload paths
+#    The "request" field is relative to the config file location
+nano login_bruteforce_config.json
+
+# 2. Test
+python ../http.intruder.py login_bruteforce_config.json --test
+
+# 3. Attack
+python ../http.intruder.py login_bruteforce_config.json
+```
 
 ---
 

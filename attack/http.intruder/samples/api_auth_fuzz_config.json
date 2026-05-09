@@ -1,0 +1,47 @@
+{
+  "_comment": "Pitchfork: test a list of user IDs paired with their known tokens (IDOR check)",
+
+  "target":      "https://api.target.com",
+  "request":     "api_auth_fuzz.txt",
+  "attack_mode": "pitchfork",
+
+  "payloads": {
+    "ID": {
+      "type":    "numbers",
+      "start":   1,
+      "end":     500,
+      "format":  "{}",
+      "test_value": "1"
+    },
+    "TOKEN": {
+      "type":  "list",
+      "values": ["token_for_user1", "token_for_user2", "token_for_user3"],
+      "test_value": "token_for_user1"
+    }
+  },
+
+  "match": {
+    "status_codes":          [200],
+    "response_contains":     [],
+    "response_not_contains": [],
+    "length_not_equals":     null
+  },
+
+  "stop": {
+    "on_first_match": false,
+    "max_matches":    0,
+    "max_requests":   0
+  },
+
+  "options": {
+    "workers":               10,
+    "timeout":               10,
+    "delay_ms":              0,
+    "follow_redirects":      false,
+    "verify_ssl":            false,
+    "update_content_length": true,
+    "save_matches_only":     false,
+    "save_response_body":    false,
+    "output":                "api_results.jsonl"
+  }
+}
