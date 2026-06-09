@@ -9,3 +9,6 @@
 
 # reconn/scantop100  (no pip packages; requires nmap system binary)
 -r reconn/scantop100/requirements.txt
+
+# reconn/ipdb
+-r reconn/ipdb/requirements.txt
