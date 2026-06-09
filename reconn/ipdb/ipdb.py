@@ -173,9 +173,6 @@ CREATE TABLE IF NOT EXISTS hosts (
     local_isp           TEXT,
     local_asn           TEXT,
     local_asn_name      TEXT,
-    local_proxy_type    TEXT,
-    local_is_proxy      TEXT,
-    local_threat        TEXT,
     local_error         TEXT,
 
     -- online ipinfo.io lookup
@@ -220,7 +217,7 @@ _UPDATE_COLS = [
     "fc_status", "fc_latency_ms", "fc_hostname", "fc_mac", "fc_source",
     "local_country_code", "local_country", "local_region", "local_city",
     "local_lat", "local_lon", "local_isp", "local_asn", "local_asn_name",
-    "local_proxy_type", "local_is_proxy", "local_threat", "local_error",
+    "local_error",
     "online_country_code", "online_country", "online_region", "online_city",
     "online_lat", "online_lon", "online_org", "online_hostname",
     "online_timezone", "online_status", "online_error",
@@ -299,33 +296,53 @@ def _clean(v) -> str | None:
 
 
 def local_lookup(ip: str) -> dict:
-    """Query the local IP2Location databases via the imported ipinfo module."""
-    try:
-        data = _ipinfo_mod.lookup(ip)
-    except Exception as e:
-        return {"error": str(e)}
+    """Query geo (DB11) and ASN databases only — proxy DB is not used."""
 
-    geo   = data.get("geo",   {})
-    asn   = data.get("asn",   {})
-    proxy = data.get("proxy", {})
+    def s(v) -> str | None:
+        return _clean(_ipinfo_mod._safe(v))
 
-    def g(d, k):
-        return _clean(d.get(k)) if isinstance(d, dict) and "error" not in d else None
+    # ── Geo (DB11) ────────────────────────────────────────────────────────────
+    cc = country = region = city = lat = lon = isp = error = None
+    db = _ipinfo_mod._load_db11()
+    if db:
+        try:
+            rec     = db.get_all(ip)
+            cc      = s(rec.country_short)
+            country = s(rec.country_long)
+            region  = s(rec.region)
+            city    = s(rec.city)
+            lat     = s(rec.latitude)
+            lon     = s(rec.longitude)
+            isp     = s(rec.isp)
+        except Exception as e:
+            error = str(e)
+    else:
+        error = "DB11 not loaded — run: python ipinfo.py --update"
+
+    # ── ASN ───────────────────────────────────────────────────────────────────
+    asn = asn_name = None
+    adb = _ipinfo_mod._load_asn()
+    if adb:
+        try:
+            arec     = adb.get_all(ip)
+            as_name  = (arec.as_name if hasattr(arec, "as_name")
+                        else getattr(arec, "asn", None))
+            asn      = s(arec.asn)
+            asn_name = s(as_name)
+        except Exception:
+            pass    # ASN is supplementary; don't block on it
 
     return {
-        "country_code": g(geo, "country_code"),
-        "country":      g(geo, "country"),
-        "region":       g(geo, "region"),
-        "city":         g(geo, "city"),
-        "lat":          g(geo, "latitude"),
-        "lon":          g(geo, "longitude"),
-        "isp":          g(geo, "isp"),
-        "asn":          g(asn, "asn"),
-        "asn_name":     g(asn, "as"),
-        "proxy_type":   g(proxy, "proxy_type"),
-        "is_proxy":     g(proxy, "is_proxy"),
-        "threat":       g(proxy, "threat"),
-        "error":        _clean(geo.get("error") or asn.get("error")),
+        "country_code": cc,
+        "country":      country,
+        "region":       region,
+        "city":         city,
+        "lat":          lat,
+        "lon":          lon,
+        "isp":          isp,
+        "asn":          asn,
+        "asn_name":     asn_name,
+        "error":        error,
     }
 
 
@@ -625,9 +642,6 @@ def process_ip(
         "local_isp":          local.get("isp"),
         "local_asn":          local.get("asn"),
         "local_asn_name":     local.get("asn_name"),
-        "local_proxy_type":   local.get("proxy_type"),
-        "local_is_proxy":     local.get("is_proxy"),
-        "local_threat":       local.get("threat"),
         "local_error":        local.get("error"),
 
         "online_country_code": online.get("country_code"),
