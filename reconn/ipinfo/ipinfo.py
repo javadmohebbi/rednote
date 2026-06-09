@@ -152,6 +152,21 @@ def _file_age_days(path: Path) -> float:
     return age_secs / 86400   # convert seconds → days  (86400 = 60 × 60 × 24)
 
 
+def _print_dl_progress(name: str, done: int, total: int) -> None:
+    """Print an in-place download progress bar."""
+    done_mb  = done  / 1_048_576
+    bar_width = 22
+    if total > 0:
+        pct  = min(100.0, done / total * 100)
+        fill = int(bar_width * pct / 100)
+        bar  = f"{'█' * fill}{'░' * (bar_width - fill)}"
+        tot_mb = total / 1_048_576
+        line = f"\r  [DL]   {name:<15}  [{bar}] {pct:5.1f}%  {done_mb:.1f}/{tot_mb:.1f} MB"
+    else:
+        line = f"\r  [DL]   {name:<15}  {done_mb:.1f} MB downloaded ..."
+    print(line, end="", flush=True)
+
+
 def download_databases(force: bool = False) -> bool:
     """
     Download and unzip all three IP2Location databases.
@@ -201,25 +216,51 @@ def download_databases(force: bool = False) -> bool:
         print(f"  [DL]   {db['name']} ← {url}")
 
         try:
+            # stream=True lets us read the body in chunks so we can display
+            # a live progress bar.
             # allow_redirects=True is required: since May 2025 IP2Location
             # redirects downloads through Cloudflare R2 storage.
-            # stream=False lets requests download the full body before returning,
-            # which means timeout=(15, 600) covers the entire transfer — not just
-            # the first byte.  With stream=True the read timeout only applies to
-            # each individual chunk, so a stalled mid-transfer connection hangs
-            # forever even with a timeout set.
+            # timeout=(15, 30): 15 s to connect, 30 s max idle between chunks.
+            # A stalled mid-transfer connection raises ReadTimeout after 30 s
+            # rather than hanging indefinitely.
             response = requests.get(
                 url,
-                stream=False,
+                stream=True,
                 allow_redirects=True,
-                timeout=(15, 600),   # 15 s connect, 10 min full-body read
+                timeout=(15, 30),
             )
 
             # raise_for_status() throws an exception if the server returned
             # an HTTP error code like 401 Unauthorized or 404 Not Found.
             response.raise_for_status()
 
-            raw_bytes = response.content
+            total_size = int(response.headers.get("content-length", 0) or 0)
+            buf = bytearray()
+
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    buf.extend(chunk)
+                    _print_dl_progress(db["name"], len(buf), total_size)
+
+            print()  # newline after the progress bar
+
+            raw_bytes = bytes(buf)
+
+            # Sanity-check before handing to zipfile: a ZIP always starts with
+            # the magic bytes b'PK'.  If we got something else (HTML error page,
+            # XML AccessDenied from R2, etc.) show the first 400 chars so the
+            # cause is immediately obvious.
+            if not raw_bytes.startswith(b"PK"):
+                preview = raw_bytes[:400].decode("utf-8", errors="replace").strip()
+                print(
+                    f"  [ERR]  {db['name']} — response is not a ZIP file "
+                    f"({len(raw_bytes):,} bytes received).\n"
+                    f"         Server response preview:\n"
+                    f"         {preview[:350]}",
+                    file=sys.stderr,
+                )
+                all_ok = False
+                continue
 
             # The downloaded file is a ZIP archive.
             # io.BytesIO wraps raw bytes so zipfile can read them like a real
@@ -254,23 +295,29 @@ def download_databases(force: bool = False) -> bool:
             dest.write_bytes(bin_data)
             print(f"  [OK]   {db['name']} → {dest}  ({len(bin_data):,} bytes)")
 
+        except requests.Timeout:
+            print(
+                f"  [ERR]  {db['name']} — download timed out "
+                f"(no data received for 30 s).\n"
+                f"         Check your connection and try again.",
+                file=sys.stderr,
+            )
+            all_ok = False
+
         except requests.HTTPError as e:
             # HTTP-level error (401 = bad token, 404 = wrong file code, etc.)
             print(f"  [ERR]  {db['name']} — HTTP error: {e}", file=sys.stderr)
             all_ok = False
 
         except requests.RequestException as e:
-            # Network-level error: timeout, DNS failure, connection refused, …
+            # Network-level error: DNS failure, connection refused, etc.
             print(f"  [ERR]  {db['name']} — network error: {e}", file=sys.stderr)
             all_ok = False
 
         except zipfile.BadZipFile:
-            # The downloaded content is not a valid ZIP.
-            # This often means the token is wrong and the server returned an
-            # HTML error page instead of the actual archive.
             print(
-                f"  [ERR]  {db['name']} — downloaded file is not a valid ZIP.\n"
-                "         Check that your IP2LOCATION_TOKEN is correct.",
+                f"  [ERR]  {db['name']} — ZIP is corrupt or incomplete.\n"
+                "         Try running --update again.",
                 file=sys.stderr,
             )
             all_ok = False
