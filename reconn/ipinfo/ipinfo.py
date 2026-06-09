@@ -201,28 +201,25 @@ def download_databases(force: bool = False) -> bool:
         print(f"  [DL]   {db['name']} ← {url}")
 
         try:
-            # requests.get() fetches the URL.
-            # stream=True means the response body is not loaded all at once;
-            # we read it in chunks below — better for large files.
-            # allow_redirects=True is important: since May 2025 IP2Location
+            # allow_redirects=True is required: since May 2025 IP2Location
             # redirects downloads through Cloudflare R2 storage.
-            # timeout=(10, 120): 10 s to connect, 120 s max to receive the body.
+            # stream=False lets requests download the full body before returning,
+            # which means timeout=(15, 600) covers the entire transfer — not just
+            # the first byte.  With stream=True the read timeout only applies to
+            # each individual chunk, so a stalled mid-transfer connection hangs
+            # forever even with a timeout set.
             response = requests.get(
                 url,
-                stream=True,
+                stream=False,
                 allow_redirects=True,
-                timeout=(10, 120),
+                timeout=(15, 600),   # 15 s connect, 10 min full-body read
             )
 
             # raise_for_status() throws an exception if the server returned
             # an HTTP error code like 401 Unauthorized or 404 Not Found.
             response.raise_for_status()
 
-            # Read the entire response body into a bytes variable.
-            # b"" is an empty bytes literal; += appends each chunk to it.
-            raw_bytes = b""
-            for chunk in response.iter_content(chunk_size=65536):  # 64 KB chunks
-                raw_bytes += chunk
+            raw_bytes = response.content
 
             # The downloaded file is a ZIP archive.
             # io.BytesIO wraps raw bytes so zipfile can read them like a real
