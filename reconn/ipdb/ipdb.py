@@ -175,6 +175,9 @@ CREATE TABLE IF NOT EXISTS hosts (
     local_asn_name      TEXT,
     local_error         TEXT,
 
+    -- rerun tracking
+    retry_count         INTEGER NOT NULL DEFAULT 0,
+
     -- online ipinfo.io lookup
     online_country_code TEXT,
     online_country      TEXT,
@@ -235,6 +238,14 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(_SCHEMA)
     conn.commit()
+    # Migrate existing databases that predate the retry_count column.
+    try:
+        conn.execute(
+            "ALTER TABLE hosts ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     return conn
 
 
@@ -243,9 +254,14 @@ def load_processed(conn: sqlite3.Connection) -> set:
 
 
 def upsert_host(conn: sqlite3.Connection, record: dict):
-    """Insert or update, preserving first_seen on conflict."""
+    """Insert or update, preserving first_seen and auto-incrementing retry_count."""
     placeholders  = ", ".join(["?"] * len(_INSERT_COLS))
-    update_clause = ", ".join(f"{c} = excluded.{c}" for c in _UPDATE_COLS)
+    # retry_count is not in _UPDATE_COLS so it is handled separately:
+    # on first insert it stays at the DEFAULT (0); on every conflict it increments.
+    update_clause = (
+        ", ".join(f"{c} = excluded.{c}" for c in _UPDATE_COLS)
+        + ", retry_count = hosts.retry_count + 1"
+    )
     sql = (
         f"INSERT INTO hosts ({', '.join(_INSERT_COLS)}) VALUES ({placeholders})\n"
         f"ON CONFLICT(ip) DO UPDATE SET {update_clause}"
@@ -281,6 +297,36 @@ def iter_fastcheck(path: Path, up_only: bool = True):
 
 def count_fastcheck(path: Path, up_only: bool = True) -> int:
     return sum(1 for _ in iter_fastcheck(path, up_only=up_only))
+
+
+def iter_rerun(conn: sqlite3.Connection):
+    """
+    Yield (ip, fc_rec, fc_source, retry_count) for every VERIFICATION_INCOMPLETE
+    record in the database.  Uses fetchall() so the snapshot is stable while
+    workers are updating rows concurrently.
+    """
+    rows = conn.execute(
+        "SELECT ip, fc_status, fc_latency_ms, fc_hostname, fc_mac, "
+        "       fc_source, retry_count "
+        "FROM   hosts "
+        "WHERE  flag_reason = 'VERIFICATION_INCOMPLETE' "
+        "ORDER BY retry_count ASC, ip ASC"
+    ).fetchall()
+    for ip, fc_status, fc_lat, fc_host, fc_mac, fc_src, retries in rows:
+        fc_rec = {
+            "status":     fc_status,
+            "latency_ms": fc_lat,
+            "hostname":   fc_host,
+            "mac":        fc_mac,
+        }
+        yield ip, fc_rec, fc_src or "", retries
+
+
+def count_rerun(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM hosts WHERE flag_reason = 'VERIFICATION_INCOMPLETE'"
+    ).fetchone()
+    return row[0] if row else 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -372,6 +418,7 @@ def online_lookup(ip: str, rate_limiter: RateLimiter) -> dict:
         # Rate-limit response: {"status":"429","error":"..."}
         err_str = str(data.get("error", "")).lower()
         if data.get("status") == "429" or "rate limit" in err_str or "too many" in err_str:
+            _pause_event.set()   # auto-pause: quota exhausted — user must resume manually
             return {"status": "rate_limited", "error": data.get("error", "rate limit exceeded")}
 
         # Any other error field (e.g. {"error":"invalid IP"})
@@ -519,7 +566,7 @@ class LiveDisplay:
             sys.stdout.flush()
 
     def add_result(self, ip: str, flagged: int, flag_reason: str | None,
-                   local_cc: str, online_cc: str):
+                   local_cc: str, online_cc: str, retry_count: int = 0):
         with self.lock:
             self.done += 1
             if flagged:
@@ -537,8 +584,9 @@ class LiveDisplay:
                 st_s  = f"{GREEN}OK  {RESET}"
                 extra = ""
 
-            cc_s = f"{DIM}L:{local_cc or '?':2}  O:{online_cc or '?':2}{RESET}"
-            line = f"{counter}  {ip:<18}  {st_s}  {cc_s}{extra}"
+            cc_s    = f"{DIM}L:{local_cc or '?':2}  O:{online_cc or '?':2}{RESET}"
+            tries_s = f"  {DIM}[try:{retry_count}]{RESET}" if retry_count > 1 else ""
+            line    = f"{counter}  {ip:<18}  {st_s}  {cc_s}{extra}{tries_s}"
 
             o = sys.stdout
             self._at(self.v_end, 1)
@@ -581,17 +629,18 @@ class SimpleDisplay:
             print("[PAUSED]  Press Enter to resume or Ctrl+C to quit...")
 
     def add_result(self, ip: str, flagged: int, flag_reason: str | None,
-                   local_cc: str, online_cc: str):
+                   local_cc: str, online_cc: str, retry_count: int = 0):
         with self.lock:
             self.done += 1
             if flagged:
                 self.n_flagged += 1
             else:
                 self.n_clean += 1
-            w      = len(str(self.total))
-            status = f"FLAG({flag_reason})" if flagged else "OK"
+            w       = len(str(self.total))
+            status  = f"FLAG({flag_reason})" if flagged else "OK"
+            tries_s = f"  [try:{retry_count}]" if retry_count > 1 else ""
             print(f"[{self.done:{w}}/{self.total}]  {ip:<18}  {status:<35}  "
-                  f"L:{local_cc or '?':2}  O:{online_cc or '?':2}")
+                  f"L:{local_cc or '?':2}  O:{online_cc or '?':2}{tries_s}")
 
     def finish(self):
         pass
@@ -609,6 +658,7 @@ def process_ip(
     country_filter: str | None,
     source_name: str,
     display,
+    retry_count: int = 0,   # current count from DB; display shows count+1 after this run
 ) -> None:
     if not wait_if_paused(display):
         return
@@ -666,6 +716,7 @@ def process_ip(
         ip, flagged, flag_reason,
         local.get("country_code") or "",
         online.get("country_code") or "",
+        retry_count + 1,    # show the new count (SQL already incremented it)
     )
 
 
@@ -692,15 +743,25 @@ def main():
             "  python ipdb.py -f fastcheck.jsonl --country US --db targets.sqlite\n"
             "  python ipdb.py -f fastcheck.jsonl -w 8 --online-delay 2.0\n"
             "  python ipdb.py -f fastcheck.jsonl --all\n"
+            "  python ipdb.py --rerun --db targets.sqlite\n"
+            "  python ipdb.py --rerun --db targets.sqlite --country US\n"
         ),
     )
     parser.add_argument(
-        "-f", "--file", required=True, metavar="JSONL",
-        help="fastcheck .jsonl input file.",
+        "-f", "--file", default=None, metavar="JSONL",
+        help="fastcheck .jsonl input file (required unless --rerun is used).",
+    )
+    parser.add_argument(
+        "--rerun", action="store_true",
+        help=(
+            "Re-process all VERIFICATION_INCOMPLETE records already in the database. "
+            "Uses --db as the source — no JSONL file needed. "
+            "retry_count is incremented for each record on every rerun."
+        ),
     )
     parser.add_argument(
         "--db", metavar="FILE", default=None,
-        help="SQLite output path (default: ipdb.sqlite next to this script).",
+        help="SQLite path (default: ipdb.sqlite next to this script).",
     )
     parser.add_argument(
         "--country", metavar="CC",
@@ -715,46 +776,113 @@ def main():
         help=(
             "Worker threads (default: 5). "
             "Online requests share a rate-limited slot, so throughput is "
-            "1 / --online-delay req/s regardless of worker count. "
-            "More workers help parallelise local lookups and DB writes."
+            "1 / --online-delay req/s regardless of worker count."
         ),
     )
     parser.add_argument(
         "--online-delay", type=float, default=1.5, metavar="SEC",
         help=(
             "Minimum seconds between ipinfo.io requests (default: 1.5). "
-            "Set to 0 to disable the delay (risk: 429 rate limiting). "
-            "Rate-limited responses are stored as online_status=rate_limited "
-            "and flagged=1 so they can be retried on the next run."
+            "Set to 0 to disable (risk: 429 rate limiting)."
         ),
     )
     parser.add_argument(
         "--all", action="store_true",
-        help="Process all hosts in the JSONL, not only 'up' ones (default: up only).",
+        help="Process all hosts in the JSONL, not only 'up' ones (ignored with --rerun).",
     )
 
     args = parser.parse_args()
 
-    _check_curl()
+    if not args.rerun and not args.file:
+        parser.error("-f/--file is required unless --rerun is used.")
 
-    src_path = Path(args.file)
-    if not src_path.exists():
-        sys.exit(f"[ERROR] File not found: {src_path}")
+    _check_curl()
 
     db_path        = Path(args.db) if args.db else Path(__file__).resolve().parent / "ipdb.sqlite"
     country_filter = args.country.strip().upper() if args.country else None
-    up_only        = not args.all
 
-    # ── Count ─────────────────────────────────────────────────────────────────
+    # ── Open DB ───────────────────────────────────────────────────────────────
+    conn = open_db(db_path)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # RERUN MODE — source is the DB itself
+    # ══════════════════════════════════════════════════════════════════════════
+    if args.rerun:
+        total = count_rerun(conn)
+        if total == 0:
+            print(f"  No VERIFICATION_INCOMPLETE records found in {db_path}")
+            conn.close()
+            return
+        print(f"  {total:,} VERIFICATION_INCOMPLETE records to recheck  ({db_path})")
+
+        rate_limiter = RateLimiter(args.online_delay)
+        signal.signal(signal.SIGINT, _sigint_handler)
+
+        Display = LiveDisplay if sys.stdout.isatty() else SimpleDisplay
+        display = Display(total, args.workers, args.online_delay, db_path, country_filter)
+
+        MAX_PENDING = args.workers * 4
+
+        def _rerun_task(ip, fc_rec, src, old_retries):
+            process_ip(
+                ip, fc_rec, conn, rate_limiter,
+                country_filter, src, display, old_retries,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                gen     = iter_rerun(conn)
+                pending = set()
+                for ip, rec, src, retries in itertools.islice(gen, MAX_PENDING):
+                    pending.add(pool.submit(_rerun_task, ip, rec, src, retries))
+
+                while pending and not _quit_event.is_set():
+                    done_futs, pending = fut_wait(pending, return_when=FIRST_COMPLETED)
+                    for f in done_futs:
+                        f.result()
+                    if not _quit_event.is_set():
+                        for ip, rec, src, retries in itertools.islice(gen, len(done_futs)):
+                            pending.add(pool.submit(_rerun_task, ip, rec, src, retries))
+
+        except Exception:
+            pass
+        finally:
+            display.finish()
+            conn.close()
+
+        # ── Rerun summary ─────────────────────────────────────────────────────
+        bar = "─" * 62
+        print(f"{BOLD}{CYAN}{bar}{RESET}")
+        print(f"{BOLD}  ipdb rerun summary{RESET}")
+        print(f"  Rechecked  : {display.done}")
+        print(f"  {GREEN}Resolved   : {display.n_clean}{RESET}  (flagged → 0)")
+        print(f"  {RED}Still flagged: {display.n_flagged}{RESET}")
+        if country_filter:
+            print(f"  Filter     : --country {country_filter}")
+        print(f"  DB         : {db_path}")
+        if _quit_event.is_set():
+            print(f"\n  {YELLOW}Stopped — re-run the same command to continue.{RESET}")
+        print(f"{BOLD}{CYAN}{bar}{RESET}\n")
+        return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # NORMAL MODE — source is a fastcheck JSONL
+    # ══════════════════════════════════════════════════════════════════════════
+    src_path = Path(args.file)
+    if not src_path.exists():
+        conn.close()
+        sys.exit(f"[ERROR] File not found: {src_path}")
+
+    up_only = not args.all
+
     print(f"  Scanning {src_path} …", end="", flush=True)
     total = count_fastcheck(src_path, up_only=up_only)
     print(f" {total:,} hosts")
 
     if total == 0:
+        conn.close()
         sys.exit("[ERROR] No hosts found. Check the input file or add --all.")
 
-    # ── Open DB and detect already-processed IPs (resume) ────────────────────
-    conn      = open_db(db_path)
     processed = load_processed(conn)
     remaining = total - len(processed)
 
@@ -766,7 +894,6 @@ def main():
         conn.close()
         return
 
-    # ── Kick off ──────────────────────────────────────────────────────────────
     rate_limiter = RateLimiter(args.online_delay)
     signal.signal(signal.SIGINT, _sigint_handler)
 
