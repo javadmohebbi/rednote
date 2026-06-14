@@ -2,7 +2,7 @@
 
 IP intelligence database builder.  
 Reads **fastcheck** `.jsonl` output, enriches every live host with geo data from two independent sources, cross-validates them, and stores all results in a **SQLite database** for downstream recon and attack tooling.  
-Supports **pause**, **resume from pause**, and **resume after being stopped**.
+Supports **pause**, **resume from pause**, **resume after being stopped**, and **rerun** of incomplete records.
 
 ---
 
@@ -24,6 +24,10 @@ python ipdb.py -f fastcheck.jsonl --country US --online-delay 2.5
 # Resume a stopped run — re-run the same command
 python ipdb.py -f fastcheck.jsonl --country US
 # Output: Resume: 12,480 already in DB, 487,520 remaining.
+
+# Rerun all VERIFICATION_INCOMPLETE records (e.g. after quota resets)
+python ipdb.py --rerun --db campaign.sqlite
+python ipdb.py --rerun --db campaign.sqlite --country US
 ```
 
 ---
@@ -48,12 +52,14 @@ python ../ipinfo/ipinfo.py --update
 
 ```
 python ipdb.py -f JSONL [options]
+python ipdb.py --rerun  [options]
 
-Required:
-  -f, --file JSONL       fastcheck .jsonl input file
+Modes:
+  -f, --file JSONL       fastcheck .jsonl input file (normal mode)
+  --rerun                re-process all VERIFICATION_INCOMPLETE records in --db
 
 Options:
-  --db FILE              SQLite output path (default: ipdb.sqlite next to this script)
+  --db FILE              SQLite path (default: ipdb.sqlite next to this script)
   --country CC           Two-letter country code to enforce (e.g. US, DE, CN)
                          Both sources must confirm CC for flagged=0.
                          Any disagreement — or unavailable source — sets flagged=1.
@@ -63,6 +69,7 @@ Options:
   --online-delay SEC     Minimum seconds between ipinfo.io requests (default: 1.5)
                          Set to 0 to disable (risk: 429 rate limiting).
   --all                  Process all hosts in the JSONL, not only 'up' ones
+                         (ignored with --rerun)
 ```
 
 ---
@@ -130,7 +137,13 @@ For large input files (500 k hosts) the online verification will take many sessi
 
 ### When a `429` is returned
 
-Rate-limited responses are **not silently dropped**. They are stored as:
+When ipinfo.io returns a rate-limit response, ipdb **auto-pauses immediately** — all workers finish their current IP and then wait. The display shows:
+
+```
+⏸ PAUSED  ↵ resume  ·  Ctrl+C quit
+```
+
+The rate-limited IP is stored as:
 
 ```
 online_status = 'rate_limited'
@@ -138,24 +151,22 @@ flagged       = 1
 flag_reason   = 'VERIFICATION_INCOMPLETE'
 ```
 
-To retry rate-limited IPs after the quota resets:
-
-```sql
-DELETE FROM hosts WHERE online_status = 'rate_limited';
-```
-
-Then re-run — they are no longer in the DB and will be re-queued automatically.
+Press **Enter** to resume once the quota resets, or **Ctrl+C** to stop and come back later. Use `--rerun` to recheck all rate-limited records in a future session.
 
 ---
 
 ## Pause and resume
 
-### Pause during a run
+### Manual pause during a run
 
 Press **Ctrl+C**. Workers finish their current IP, then wait.  
 The footer shows `⏸ PAUSED  ↵ resume  ·  Ctrl+C quit`.
 
 Press **Enter** to resume. Press **Ctrl+C** again to quit.
+
+### Auto-pause on rate limit
+
+When ipinfo.io returns a `429`, the tool pauses itself — no Ctrl+C needed. Same footer, same controls. Resume after waiting for the quota window to reset.
 
 ### Resume after stopping
 
@@ -171,6 +182,32 @@ python ipdb.py -f live.jsonl --country US
 ```
 
 `first_seen` is preserved when an IP is re-processed — it always reflects when the IP was first encountered.
+
+---
+
+## Rerun mode
+
+`--rerun` re-processes every `VERIFICATION_INCOMPLETE` record already in the database. No JSONL file is needed — the DB itself is the source. Use this after:
+
+- the ipinfo.io monthly quota resets
+- a network outage cleared
+- timeout errors resolved
+
+```bash
+# Recheck all incomplete records
+python ipdb.py --rerun --db campaign.sqlite
+
+# With a country filter applied to the recheck
+python ipdb.py --rerun --db campaign.sqlite --country US
+```
+
+Each recheck increments `retry_count` for the record. The live display shows the try number next to each result:
+
+```
+[  3/87]  104.21.18.9    FLAG  L:US  O:?   VERIFICATION_INCOMPLETE  [try:3]
+```
+
+Records that resolve cleanly on rerun are updated to `flagged=0`. Records that fail again remain flagged with an incremented `retry_count`.
 
 ---
 
@@ -194,6 +231,7 @@ Fixed header, scrolling results, fixed footer — the screen never scrolls.
 ```
 
 `L:` = local IP2Location result, `O:` = online ipinfo.io result.  
+`[try:N]` appears on rerun records when N > 1.  
 When output is piped or redirected (non-TTY), plain line-by-line output is used instead.
 
 ---
@@ -221,10 +259,10 @@ hosts (
     local_lat / local_lon
     local_isp
     local_asn / local_asn_name
-    local_proxy_type
-    local_is_proxy
-    local_threat
     local_error         -- NULL on success
+
+    -- rerun tracking
+    retry_count         -- incremented each time this record is reprocessed
 
     -- online ipinfo.io
     online_country_code -- e.g. 'US'
@@ -250,6 +288,8 @@ hosts (
 )
 ```
 
+Existing databases are migrated automatically — `retry_count` is added via `ALTER TABLE` on first open if it doesn't exist.
+
 ---
 
 ## Querying the database
@@ -270,16 +310,17 @@ SELECT local_country_code, COUNT(*) AS n
   FROM hosts WHERE flagged = 0
   GROUP BY local_country_code ORDER BY n DESC;
 
--- Rate-limited IPs that need retry
+-- Rate-limited IPs (candidates for --rerun)
 SELECT ip FROM hosts WHERE online_status = 'rate_limited';
+
+-- Records with the most rerun attempts
+SELECT ip, retry_count, flag_reason
+  FROM hosts WHERE retry_count > 0
+  ORDER BY retry_count DESC LIMIT 20;
 
 -- IPs where sources disagree (for investigation)
 SELECT ip, local_country_code, online_country_code
   FROM hosts WHERE flag_reason = 'COUNTRY_MISMATCH';
-
--- Proxy/VPN IPs (even if country matches)
-SELECT ip, local_proxy_type, local_is_proxy
-  FROM hosts WHERE local_is_proxy LIKE 'Yes%';
 ```
 
 ### Python
@@ -321,6 +362,8 @@ sqlite3 campaign.sqlite "SELECT flagged, COUNT(*) FROM hosts GROUP BY flagged"
 
 - **Both sources always queried**: local and online lookups run for every IP — there is no short-circuit.
 - **`--country` is strict**: if either source is unavailable (timeout, rate limit, error), the IP is flagged even if the other source matches. The goal is certainty.
+- **Auto-pause on 429**: a rate-limit response from ipinfo.io pauses all workers immediately. Press Enter to resume; the record is stored as `VERIFICATION_INCOMPLETE` and can be retried with `--rerun`.
+- **`--rerun` is safe to repeat**: it increments `retry_count` each time and only touches `VERIFICATION_INCOMPLETE` records. Already-clean records are never re-queried.
 - **Memory**: the fastcheck JSONL is read line-by-line — a 500 k-record file uses the same ~few MB of RAM as a 10-record file.
 - **Task queue**: at most `workers × 4` futures are live at once; the rest wait in the generator.
 - **Online requests are serialized**: all N workers share one `RateLimiter`. Throughput is `1 / online-delay` req/s regardless of worker count. Workers help with local lookups and DB writes, not online speed.
