@@ -1,0 +1,14 @@
+# vault uses ipinfo module directly (same deps)
+IP2Location
+IP2Proxy
+python-dotenv
+requests
+
+# System tools (must be installed separately):
+#   nmap >= 7.0
+#     Kali / Debian:  apt install nmap
+#   curl
+#     Kali / Debian:  apt install curl
+#   searchsploit  (optional, for --searchsploit flag)
+#     Kali / Debian:  apt install exploitdb
+#     or:            git clone https://github.com/offensive-security/exploit-database

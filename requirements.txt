@@ -12,3 +12,6 @@
 
 # reconn/ipdb
 -r reconn/ipdb/requirements.txt
+
+# reconn/vault  (requires nmap, curl; optional: exploitdb/searchsploit)
+-r reconn/vault/requirements.txt
