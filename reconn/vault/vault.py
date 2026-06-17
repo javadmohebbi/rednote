@@ -746,26 +746,44 @@ def count_source(source_iter) -> tuple[list, int]:
 # 10 — Display
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Stage label + color (fixed width so columns stay aligned)
+_STAGE_FMT = {
+    "validate":    (DIM,     "verify  "),
+    "scan":        (CYAN,    "nmap    "),
+    "sploit":      (MAGENTA, "sploit  "),
+    "store":       (DIM,     "store   "),
+    "idle":        (DIM,     "idle    "),
+}
+
+
 class LiveDisplay:
-    HEADER = 4
-    FOOTER = 3
+    HEADER = 4   # rows 1-4: title bar
+    FOOTER = 2   # rows -1,-2: stats + separator
 
     def __init__(self, total: int, workers: int, db_path: Path,
                  country_filter: str | None):
-        cols, rows     = shutil.get_terminal_size((80, 24))
-        self.total     = total
-        self.cols      = cols
-        self.rows      = rows
-        self.v_start   = self.HEADER + 1
-        self.v_end     = max(self.v_start + 2, rows - self.FOOTER)
-        self.f_sep     = self.v_end + 1
-        self.f_stats   = self.v_end + 2
-        self.lock      = threading.Lock()
-        self.done      = 0
-        self.n_ok      = 0
-        self.n_skip    = 0
-        self.n_err     = 0
-        self._paused   = False
+        cols, rows      = shutil.get_terminal_size((80, 24))
+        self.total      = total
+        self.cols       = cols
+        self.rows       = rows
+        self.n_workers  = workers
+        # Worker panel sits between header and scroll area
+        self._w_start   = self.HEADER + 1          # first worker row
+        self._w_sep     = self._w_start + workers  # separator below workers
+        self.v_start    = self._w_sep + 1           # scroll area top
+        self.v_end      = max(self.v_start + 2, rows - self.FOOTER)
+        self.f_sep      = self.v_end + 1
+        self.f_stats    = self.v_end + 2
+
+        self.lock           = threading.Lock()
+        self.done           = 0
+        self.n_ok           = 0
+        self.n_skip         = 0
+        self.n_err          = 0
+        self._paused        = False
+        self._thread_slots: dict[int, int] = {}   # thread_id → slot index
+        self._workers:      dict[int, dict] = {}  # slot → {ip, stage, t0}
+        self._ticker_stop   = threading.Event()
 
         o   = sys.stdout
         bar = "─" * cols
@@ -778,19 +796,50 @@ class LiveDisplay:
         self._at(2); o.write(f"{BOLD}  vault  ·  recon intelligence database{cf_s}{RESET}")
         self._at(3); o.write(f"  Targets: {total}  Workers: {workers}  →  {db_path}")
         self._at(4); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
+
+        # Draw initial idle worker lines
+        for slot in range(workers):
+            self._draw_worker_line(slot)
+        self._at(self._w_sep); o.write(f"{DIM}{bar}{RESET}")
+
         self._at(self.f_sep);  o.write(f"{DIM}{bar}{RESET}")
         self._draw_stats()
         o.write(f"\033[{self.v_start};{self.v_end}r")
         self._at(self.v_end)
         o.flush()
 
+        self._start_ticker()
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
     def _at(self, row: int, col: int = 1):
         sys.stdout.write(f"\033[{row};{col}H")
+
+    def _draw_worker_line(self, slot: int):
+        """Draw one worker-status line in place. Caller must hold self.lock."""
+        w   = self._workers.get(slot)
+        row = self._w_start + slot
+        o   = sys.stdout
+        self._at(row)
+        o.write("\033[K")
+
+        if w is None:
+            color, label = _STAGE_FMT["idle"]
+            o.write(f"  {DIM}○  {'—':<18}  {color}[ {label}]{RESET}")
+        else:
+            ip      = w["ip"]
+            stage   = w["stage"]
+            elapsed = time.monotonic() - w["t0"]
+            mins    = int(elapsed) // 60
+            secs    = int(elapsed) % 60
+            color, label = _STAGE_FMT.get(stage, (DIM, stage[:8].ljust(8)))
+            el_s = f"  {DIM}{mins:02d}:{secs:02d}{RESET}" if stage in ("scan", "sploit") else ""
+            o.write(f"  {CYAN}●{RESET}  {ip:<18}  {color}[ {label}]{RESET}{el_s}")
 
     def _draw_stats(self):
         o    = sys.stdout
         pct  = self.done / self.total if self.total else 0
-        bw   = max(10, min(30, self.cols - 60))
+        bw   = max(10, min(28, self.cols - 62))
         fill = int(bw * pct)
         prog = f"{'█' * fill}{'░' * (bw - fill)}"
         self._at(self.f_stats)
@@ -805,6 +854,39 @@ class LiveDisplay:
             o.write(base + f"  {YELLOW}{BOLD}⏸ PAUSED{RESET}  ↵ resume  ·  Ctrl+C quit")
         else:
             o.write(base)
+
+    def _start_ticker(self):
+        """Background thread that refreshes worker elapsed times every second."""
+        def _tick():
+            while not self._ticker_stop.wait(1.0):
+                with self.lock:
+                    for slot in list(self._workers):
+                        self._draw_worker_line(slot)
+                    self._at(self.v_end)
+                    sys.stdout.flush()
+        threading.Thread(target=_tick, daemon=True).start()
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def update_worker(self, ip: str, stage: str):
+        """Update the status panel for the calling worker thread."""
+        tid = threading.get_ident()
+        now = time.monotonic()
+        with self.lock:
+            if tid not in self._thread_slots:
+                self._thread_slots[tid] = len(self._thread_slots)
+            slot = self._thread_slots[tid]
+
+            if stage == "idle":
+                self._workers.pop(slot, None)
+            else:
+                prev = self._workers.get(slot, {})
+                if prev.get("ip") != ip or prev.get("stage") != stage:
+                    self._workers[slot] = {"ip": ip, "stage": stage, "t0": now}
+
+            self._draw_worker_line(slot)
+            self._at(self.v_end)
+            sys.stdout.flush()
 
     def set_paused(self, paused: bool):
         with self.lock:
@@ -839,6 +921,7 @@ class LiveDisplay:
             o.flush()
 
     def finish(self):
+        self._ticker_stop.set()
         with self.lock:
             o = sys.stdout
             o.write("\033[r\033[?7h\033[?25h")
@@ -848,6 +931,14 @@ class LiveDisplay:
 
 
 class SimpleDisplay:
+    _STAGE_LABELS = {
+        "validate": "checking country ...",
+        "scan":     "nmap scan started   ",
+        "sploit":   "searchsploit ...    ",
+        "store":    "storing results     ",
+        "idle":     None,
+    }
+
     def __init__(self, total: int, workers: int, db_path: Path,
                  country_filter: str | None):
         self.total  = total
@@ -862,6 +953,11 @@ class SimpleDisplay:
         print(f"  vault  ·  recon intelligence database{cf_s}")
         print(f"  Targets: {total}  Workers: {workers}  →  {db_path}")
         print(f"{bar}\n")
+
+    def update_worker(self, ip: str, stage: str):
+        label = self._STAGE_LABELS.get(stage)
+        if label:
+            print(f"         {ip:<18}  {label}")
 
     def set_paused(self, paused: bool):
         if paused:
@@ -910,6 +1006,7 @@ def process_ip(
     country_cc  = None
 
     if country_filter:
+        display.update_worker(ip, "validate")
         ok, lcc, occ = validate_country(ip, country_filter, rl)
         country_cc   = lcc or occ
         if not ok:
@@ -917,6 +1014,7 @@ def process_ip(
             flag_reason = ("COUNTRY_MISMATCH"
                            if (lcc and occ) else "VERIFICATION_INCOMPLETE")
             store_skipped(conn, ip, country_cc, country_filter, flagged, flag_reason)
+            display.update_worker(ip, "idle")
             display.add_result(
                 ip, "skip",
                 f"L:{lcc or '?'}  O:{occ or '?'}  {flag_reason}",
@@ -932,12 +1030,14 @@ def process_ip(
         return
 
     # ── Nmap scan ─────────────────────────────────────────────────────────────
+    display.update_worker(ip, "scan")
     _set_scan_status(conn, ip, "scanning")
     started_at = _now()
     scan, cmd  = run_nmap(ip, nmap_extra, nmap_timeout)
 
     # ── searchsploit enrichment ───────────────────────────────────────────────
     if use_searchsploit and not scan.get("error"):
+        display.update_worker(ip, "sploit")
         seen_products: set = set()
         extra_vulns: list  = []
         for p in scan.get("ports", []):
@@ -951,6 +1051,7 @@ def process_ip(
                     extra_vulns.append(v)
         scan.setdefault("vulns", []).extend(extra_vulns)
 
+    display.update_worker(ip, "store")
     store_results(
         conn, ip, scan, country_cc, country_filter,
         flagged, flag_reason, cmd, started_at,
@@ -961,6 +1062,7 @@ def process_ip(
     os_s    = (scan.get("os") or "")[:24]
     err     = scan.get("error")
 
+    display.update_worker(ip, "idle")
     if err:
         display.add_result(ip, "error", f"nmap: {err[:55]}")
     else:
