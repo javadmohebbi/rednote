@@ -3,7 +3,7 @@
 Central recon intelligence database.  
 Validates target IPs against a country code (local IP2Location + online ipinfo.io), scans each host with **nmap** (OS, services, open ports, vulnerabilities, CVEs), optionally cross-references findings with **searchsploit**, and stores everything in a **shared SQLite database** designed to be extended by other tools in the pipeline.
 
-Supports **pause**, **resume from pause**, and **resume after being stopped**.
+Supports **pause**, **resume from pause**, **resume after being stopped**, and **proxychains4**.
 
 ---
 
@@ -22,6 +22,9 @@ python vault.py -f targets.jsonl --country US -w 3 --nmap-args "-p 1-10000 -T3"
 # Include searchsploit CVE lookup for found services
 python vault.py -f targets.jsonl --country US --searchsploit
 
+# Run through proxychains4 — all subprocesses (nmap, curl) are auto-proxied
+proxychains4 -q python vault.py -f targets.jsonl --country US
+
 # Resume a stopped run — re-run the same command
 python vault.py -f targets.jsonl --country US
 # Output: Resume: 120 already done, 380 remaining.
@@ -39,6 +42,9 @@ apt install nmap curl
 
 # Optional — for --searchsploit
 apt install exploitdb
+
+# Optional — for proxychains support
+apt install proxychains4
 ```
 
 IP2Location binary databases must be downloaded first:
@@ -75,6 +81,8 @@ Options:
   --online-delay SEC       Minimum seconds between ipinfo.io requests (default: 1.5)
   --searchsploit           Cross-reference found services with searchsploit
   --all                    Process all hosts in JSONL, not only status='up' ones
+  --proxychains            Force proxychains4 mode (auto-detected when launched
+                           via proxychains4; switches nmap to -sT, drops -O)
 ```
 
 ### vreport.py — reporter
@@ -165,20 +173,28 @@ python vault.py -f targets.jsonl --country US
 
 ## Live display
 
+A fixed worker-status panel shows what every concurrent slot is doing in real time. Elapsed time on the `nmap` and `sploit` stages updates every second.
+
 ```
 ──────────────────────────────────────────────────────────────────
-  vault  ·  recon intelligence database  filter: US
+  vault  ·  recon intelligence database  filter: US  [proxychains]
   Targets: 500  Workers: 5  →  vault.sqlite
 ──────────────────────────────────────────────────────────────────
-  [  1/500]  104.21.18.7    SCAN  8 port(s)  3 vuln(s)  [Linux 4.15]   ▲
-  [  2/500]  104.21.18.9    SKIP  L:US  O:DE  COUNTRY_MISMATCH          │
-  [  3/500]  198.41.0.1     SCAN  2 port(s)  0 vuln(s)                  │ scroll
-  [  4/500]  104.21.19.2    ERR   nmap: timed out (600s)                 │ region
-  [  5/500]  104.21.19.5    SCAN  12 port(s)  7 vuln(s)  [Windows 10]  ▼
+  ●  104.21.18.7       [ nmap    ]  02:14
+  ●  198.41.0.1        [ verify  ]
+  ●  10.0.0.5          [ nmap    ]  00:33
+  ●  172.16.0.3        [ sploit  ]  04:01
+  ○  —                 [ idle    ]
 ──────────────────────────────────────────────────────────────────
-  Scanned: 4       Skipped: 1       Errors: 1       [████░░░░░░░]  5/500
+  [  1/500]  104.21.18.9    SKIP  L:US  O:DE  COUNTRY_MISMATCH    ▲
+  [  2/500]  10.0.0.1       SCAN  8 port(s)  3 vuln(s)  [Linux]   ▼
+──────────────────────────────────────────────────────────────────
+  Scanned: 2    Skipped: 1    Errors: 0    [█░░░░░░░░░░░]  3/500
 ──────────────────────────────────────────────────────────────────
 ```
+
+Worker stages: `verify` → `nmap` → `sploit` (if `--searchsploit`) → `store` → `idle`.  
+`[proxychains]` appears in the header when proxychains4 mode is active.
 
 ---
 
@@ -299,10 +315,33 @@ SELECT DISTINCT p.ip, p.product, p.version, v.cve, v.severity
 
 ---
 
+## proxychains4
+
+vault auto-detects proxychains by inspecting `LD_PRELOAD` / `PROXYCHAINS_CONF_FILE` at startup — no flag needed when launched as `proxychains4 -q python vault.py`. Use `--proxychains` to force it on manually.
+
+When proxychains mode is active:
+
+| What changes | Why |
+|---|---|
+| `proxychains4 -q` prepended to every `nmap`, `curl`, `searchsploit` call | nmap is often setuid root; setuid binaries ignore `LD_PRELOAD` inheritance, so explicit prefixing is required |
+| nmap switches to `-sT` (TCP connect scan) | Default `-sS` (SYN scan) uses raw sockets that proxychains cannot intercept |
+| nmap drops `-O` (OS detection) | OS detection also relies on raw sockets |
+| `[proxychains]` shown in the live display header | Confirms the mode is active |
+
+```bash
+# Auto-detected — no extra flag needed
+proxychains4 -q python vault.py -f targets.jsonl --country US
+
+# Force manually (e.g. when wrapping with a custom proxy script)
+python vault.py -f targets.jsonl --country US --proxychains
+```
+
+---
+
 ## Notes
 
-- **Workers = concurrent nmap processes**: each worker runs a full `nmap -sV -O --script=vuln` against one host. 5 concurrent nmap processes is the default; reduce with `-w` on underpowered hardware.
-- **OS detection needs root**: the `-O` flag is automatically included when running as root/sudo, and automatically skipped otherwise.
+- **Workers = concurrent nmap processes**: each worker runs a full `nmap -sV [-O] --script=vuln` against one host. 5 concurrent nmap processes is the default; reduce with `-w` on underpowered hardware.
+- **OS detection needs root**: the `-O` flag is automatically included when running as root/sudo, skipped otherwise, and always skipped in proxychains mode (raw sockets bypass the proxy).
 - **nmap vuln scripts**: the `vuln` script category includes ssl-heartbleed, ms17-010 (EternalBlue), smb-vuln-*, http-shellshock, and many more. Install the `vulners` NSE script for CVE-mapped results: `nmap --script-updatedb`.
 - **searchsploit**: optional enrichment that cross-references detected service/version strings with the Exploit-DB. Slow for many services; use on targeted scans.
 - **Resume**: any host with `scan_status='done'` is skipped on re-run. Hosts interrupted mid-scan (status was `'scanning'`) are reset to `'pending'` and retried.
