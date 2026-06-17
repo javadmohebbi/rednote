@@ -70,7 +70,24 @@ YELLOW  = "\033[33m"
 CYAN    = "\033[36m"
 MAGENTA = "\033[35m"
 
-_IS_ROOT = (os.geteuid() == 0) if hasattr(os, "geteuid") else True
+_IS_ROOT      = (os.geteuid() == 0) if hasattr(os, "geteuid") else True
+_PROXYCHAINED = False   # set in main(); True when running under proxychains4
+
+
+def _detect_proxychains() -> bool:
+    """True when the process was launched under proxychains4."""
+    ld = (os.environ.get("LD_PRELOAD", "")
+          + os.environ.get("DYLD_INSERT_LIBRARIES", ""))   # macOS fallback
+    return (
+        "proxychains" in ld.lower()
+        or bool(os.environ.get("PROXYCHAINS_CONF_FILE"))
+        or bool(os.environ.get("PROXYCHAINS_SOCKS5_HOST"))
+    )
+
+
+def _proxy_prefix() -> list:
+    """Return ['proxychains4', '-q'] when proxychained, else []."""
+    return ["proxychains4", "-q"] if _PROXYCHAINED else []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -264,7 +281,7 @@ def _online_cc(ip: str, rl: RateLimiter) -> str | None:
         return None
     try:
         proc = subprocess.run(
-            ["curl", "-s", "--max-time", "10", f"ipinfo.io/{ip}"],
+            _proxy_prefix() + ["curl", "-s", "--max-time", "10", f"ipinfo.io/{ip}"],
             capture_output=True, timeout=15,
         )
         raw = proc.stdout.decode(errors="replace").strip()
@@ -300,6 +317,8 @@ def check_tools(use_searchsploit: bool):
     required = ["nmap", "curl"]
     if use_searchsploit:
         required.append("searchsploit")
+    if _PROXYCHAINED:
+        required.insert(0, "proxychains4")
     missing = []
     for t in required:
         try:
@@ -309,9 +328,16 @@ def check_tools(use_searchsploit: bool):
     if missing:
         for t in missing:
             print(f"[ERROR] missing tool: {t}", file=sys.stderr)
-        print("[ERROR] Install with: apt install nmap exploitdb curl", file=sys.stderr)
+        print("[ERROR] Install with: apt install nmap exploitdb curl proxychains4",
+              file=sys.stderr)
         sys.exit(1)
-    if not _IS_ROOT:
+    if _PROXYCHAINED:
+        print(
+            f"{CYAN}[proxy]{RESET} proxychains4 active — "
+            f"nmap will use -sT (TCP connect), OS detection disabled.",
+            file=sys.stderr,
+        )
+    elif not _IS_ROOT:
         print(
             f"{YELLOW}[WARN]{RESET} Not running as root — OS detection (-O) will be skipped.\n"
             f"       Re-run with sudo for full results.",
@@ -501,10 +527,18 @@ def parse_nmap_xml(xml_bytes: bytes) -> dict:
 
 
 def run_nmap(ip: str, extra_args: list, timeout_sec: int) -> tuple[dict, str]:
-    os_flag = ["-O"] if _IS_ROOT else []
-    cmd     = (["nmap", "-sV"] + os_flag +
-               ["--script=vuln", "-T4", "--open", "-oX", "-"] +
-               extra_args + [ip])
+    # Proxychains can only intercept connect()-based traffic.
+    # nmap's default SYN scan (-sS) and OS detection (-O) use raw sockets which
+    # bypass proxychains entirely, so both are replaced/dropped when proxychained.
+    if _PROXYCHAINED:
+        scan_type = ["-sT"]   # TCP connect — goes through proxychains
+        os_flag   = []        # -O uses raw sockets; skip
+    else:
+        scan_type = []        # nmap defaults to -sS (requires root) or -sT
+        os_flag   = ["-O"] if _IS_ROOT else []
+
+    cmd = (_proxy_prefix() + ["nmap", "-sV"] + os_flag + scan_type +
+           ["--script=vuln", "-T4", "--open", "-oX", "-"] + extra_args + [ip])
     cmd_str = " ".join(cmd)
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout_sec)
@@ -528,7 +562,7 @@ def run_searchsploit(product: str, version: str | None) -> list:
     query = f"{product} {version}".strip() if version else product
     try:
         proc = subprocess.run(
-            ["searchsploit", "--id", query],
+            _proxy_prefix() + ["searchsploit", "--id", query],
             capture_output=True, timeout=30,
         )
         out   = proc.stdout.decode(errors="replace")
@@ -793,7 +827,8 @@ class LiveDisplay:
         o.write("\033[?25l")
         o.write("\033[?7l")
         self._at(1); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
-        self._at(2); o.write(f"{BOLD}  vault  ·  recon intelligence database{cf_s}{RESET}")
+        proxy_s = f"  {CYAN}[proxychains]{RESET}" if _PROXYCHAINED else ""
+        self._at(2); o.write(f"{BOLD}  vault  ·  recon intelligence database{cf_s}{proxy_s}{RESET}")
         self._at(3); o.write(f"  Targets: {total}  Workers: {workers}  →  {db_path}")
         self._at(4); o.write(f"{BOLD}{CYAN}{bar}{RESET}")
 
@@ -1119,8 +1154,17 @@ def main():
         help="Cross-reference found services with searchsploit for additional CVEs")
     parser.add_argument("--all", action="store_true",
         help="Process all hosts in JSONL, not only those with status='up'")
+    parser.add_argument("--proxychains", action="store_true",
+        help=(
+            "Prepend 'proxychains4 -q' to every subprocess call (nmap, curl, searchsploit). "
+            "Auto-detected when vault.py is launched via proxychains4; "
+            "also forces nmap into -sT mode and disables OS detection (-O)."
+        ))
 
     args = parser.parse_args()
+
+    global _PROXYCHAINED
+    _PROXYCHAINED = args.proxychains or _detect_proxychains()
 
     check_tools(args.searchsploit)
 
