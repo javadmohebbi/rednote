@@ -30,6 +30,7 @@ Usage
 
 import os
 import re
+import stat
 import sys
 import json
 import time
@@ -337,6 +338,22 @@ def check_tools(use_searchsploit: bool):
             f"nmap will use -sT (TCP connect), OS detection disabled.",
             file=sys.stderr,
         )
+        # Setuid binaries ignore LD_PRELOAD — proxychains injection is silently skipped.
+        # Warn early so the user knows traffic may not be proxied.
+        nmap_path = shutil.which("nmap")
+        if nmap_path:
+            try:
+                st = os.stat(nmap_path)
+                if st.st_mode & stat.S_ISUID:
+                    print(
+                        f"{RED}[WARN]{RESET} nmap at {nmap_path} has the setuid bit set.\n"
+                        f"       Linux strips LD_PRELOAD for setuid binaries — proxychains\n"
+                        f"       cannot inject into nmap and traffic will NOT be proxied.\n"
+                        f"       Fix:  sudo chmod -s {nmap_path}",
+                        file=sys.stderr,
+                    )
+            except OSError:
+                pass
     elif not _IS_ROOT:
         print(
             f"{YELLOW}[WARN]{RESET} Not running as root — OS detection (-O) will be skipped.\n"
